@@ -2,6 +2,8 @@
 set -eu
 umask 077
 
+ENGINE_VERSION=2
+
 PROFILE="${ROUTER_MACHINE_GIT_PROFILE:-/etc/router-machine-git-source.conf}"
 MODE="${1:---check}"
 MESSAGE="${2:-}"
@@ -429,7 +431,8 @@ git_meta \
     -e 'BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY' \
     -e '(PrivateKey|PresharedKey)[[:space:]]*=[[:space:]]*[A-Za-z0-9+/]{40,}' \
     -e 'Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[A-Za-z0-9+/_.=-]{12,}' \
-    -e '(PASSWORD|PASSWD|TOKEN|SECRET|ACCESS_CODE|API_KEY)[[:space:]]*=[[:space:]]*[^$[:space:]]{12,}' \
+    -e '(PASSWORD|PASSWD|TOKEN|SECRET|ACCESS_CODE|API_KEY)[[:space:]]*=[[:space:]]*[^A-Za-z0-9[:space:]]?[A-Za-z0-9+/_=-]{20,}[^A-Za-z0-9[:space:]]?([[:space:]]|$)' \
+    -e 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' \
     -e 'ghp_[A-Za-z0-9]{20,}' \
     -e 'github_pat_[A-Za-z0-9_]{20,}' \
     "$TREE_SHA" \
