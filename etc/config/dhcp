@@ -1,0 +1,47 @@
+
+config dnsmasq
+	option domainneeded '1'
+	option localise_queries '1'
+	option rebind_protection '1'
+	option rebind_localhost '1'
+	option local '/lan/'
+	option domain 'lan'
+	option expandhosts '1'
+	option cachesize '1000'
+	option authoritative '1'
+	option readethers '1'
+	option leasefile '/tmp/dhcp.leases'
+	option localservice '1'
+	option ednspacket_max '1232'
+	option noresolv '1'
+	list server '1.1.1.1'
+	list server '8.8.8.8'
+	list server '9.9.9.9'
+	list addnmount '/var/run/pbr.dnsmasq'
+
+config dhcp 'lan'
+	option interface 'lan'
+	option start '100'
+	option limit '100'
+	option leasetime '12h'
+	option dhcpv4 'server'
+	option dhcpv6 'disabled'
+	option ra 'disabled'
+
+config odhcpd 'odhcpd'
+	option maindhcp '0'
+	option leasefile '/tmp/hosts/odhcpd'
+	option leasetrigger '/usr/sbin/odhcpd-update'
+	option loglevel '4'
+
+config host
+	option name 'wg-guest'
+	option ip '10.71.1.189'
+	list mac 'BC:24:11:81:3F:F6'
+
+config host
+	option name 'vm105-control-panel'
+	option mac 'bc:24:11:97:99:24'
+	option ip '10.71.100.105'
+	option leasetime 'infinite'
+

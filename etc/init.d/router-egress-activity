@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=97
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    /usr/local/sbin/router-egress-activity-apply.sh
+    procd_open_instance
+    procd_set_param command /bin/sh -c 'sleep 3600'
+    procd_set_param respawn 3600 5 0
+    procd_close_instance
+}
+
+reload_service() {
+    /usr/local/sbin/router-egress-activity-apply.sh
+}
+
+stop_service() {
+    nft delete table inet router_egress_activity 2>/dev/null || true
+}

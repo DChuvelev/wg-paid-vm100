@@ -1,0 +1,146 @@
+
+config defaults
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	option synflood_protect '1'
+
+config zone
+	option name 'lan'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'ACCEPT'
+	list network 'lan'
+
+config zone
+	option name 'transit_direct'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	list network 'transit_direct'
+	option masq '1'
+	option mtu_fix '1'
+
+config forwarding
+	option src 'lan'
+	option dest 'transit_direct'
+
+config zone
+	option name 'transit_vpn'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	option masq '1'
+	option mtu_fix '1'
+	list network 'transit_vpn'
+
+config forwarding
+	option src 'lan'
+	option dest 'transit_vpn'
+
+config zone
+	option name 'remote_in'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'ACCEPT'
+	list network 'wg_remote'
+
+config forwarding
+	option src 'remote_in'
+	option dest 'lan'
+
+config forwarding
+	option src 'remote_in'
+	option dest 'transit_direct'
+
+config forwarding
+	option src 'remote_in'
+	option dest 'transit_vpn'
+
+config rule
+	option src 'transit_direct'
+	option name 'Allow-WG-Remote-In'
+	list proto 'udp'
+	list dest_ip '10.201.0.1'
+	option dest_port '51820'
+	option target 'ACCEPT'
+
+config rule
+	option name 'ALLOW_OWNER_DNS_VM100'
+	option family 'ipv4'
+	option src 'remote_in'
+	option src_ip '10.250.1.3'
+	option proto 'tcp udp'
+	option dest_port '53'
+	option target 'ACCEPT'
+
+config rule
+	option name 'ALLOW_OWNER_WGEASY_UI'
+	option family 'ipv4'
+	option src 'remote_in'
+	option dest 'lan'
+	option src_ip '10.250.1.3'
+	option dest_ip '10.71.1.189'
+	option proto 'tcp'
+	option dest_port '51822'
+	option target 'ACCEPT'
+
+config rule
+	option name 'BLOCK_OWNER_VM100_ROUTER'
+	option family 'ipv4'
+	option src 'remote_in'
+	option src_ip '10.250.1.3'
+	option proto 'all'
+	option target 'REJECT'
+
+config rule
+	option name 'BLOCK_OWNER_VM101'
+	option family 'ipv4'
+	option src 'remote_in'
+	option dest 'lan'
+	option src_ip '10.250.1.3'
+	option dest_ip '10.71.1.2'
+	option proto 'all'
+	option target 'REJECT'
+
+config rule
+	option name 'BLOCK_OWNER_PROXMOX'
+	option family 'ipv4'
+	option src 'remote_in'
+	option dest 'lan'
+	option src_ip '10.250.1.3'
+	option dest_ip '10.71.1.222'
+	option proto 'all'
+	option target 'REJECT'
+
+config rule
+	option name 'BLOCK_OWNER_VM103_EXCEPT_UI'
+	option family 'ipv4'
+	option src 'remote_in'
+	option dest 'lan'
+	option src_ip '10.250.1.3'
+	option dest_ip '10.71.1.189'
+	option proto 'all'
+	option target 'REJECT'
+
+config zone 'wg_paid'
+	option name 'wg_paid'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	list network 'wg_paid'
+
+config forwarding 'wg_paid_to_transit_direct'
+	option src 'wg_paid'
+	option dest 'transit_direct'
+
+config forwarding 'wg_paid_to_transit_vpn'
+	option src 'wg_paid'
+	option dest 'transit_vpn'
+
+config rule 'allow_wg_paid_51830'
+	option name 'Allow-WG-Paid-51830'
+	option proto 'udp'
+	option dest_port '51830'
+	option target 'ACCEPT'
+

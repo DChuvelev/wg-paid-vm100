@@ -1,0 +1,40 @@
+#!/bin/sh
+
+# Restart PBR after VM100 transit interfaces are really up.
+# Needed because PBR may start too early during boot.
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || exit 0
+
+case "$INTERFACE" in
+    transit_direct|transit_vpn|lan)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+LOCK="/tmp/pbr-delayed-restart.lock"
+
+mkdir "$LOCK" 2>/dev/null || exit 0
+
+(
+    logger -t pbr-delay "scheduled after $INTERFACE $ACTION"
+
+    # Wait until both transit routes/gateways are visible.
+    for i in $(seq 1 30); do
+        ip route | grep -q "10.201.0.2" && \
+        ip route | grep -q "10.200.0.2" && break
+        sleep 2
+    done
+
+    # Small extra delay for firewall/fw4 to settle.
+    sleep 5
+
+    /etc/init.d/pbr restart
+
+    logger -t pbr-delay "pbr restarted after network readiness check"
+
+    rmdir "$LOCK" 2>/dev/null
+) &
+
+exit 0
