@@ -45,3 +45,13 @@ config host
 	option ip '10.71.100.105'
 	option leasetime 'infinite'
 
+config host
+	option name 'ubuntu-ai'
+	option ip '10.71.100.82'
+	list mac 'BC:24:11:41:9C:2B'
+
+config host
+	option name 'router-ops'
+	option ip '10.71.100.84'
+	list mac 'BC:24:11:EF:BA:33'
+
