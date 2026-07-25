@@ -6,6 +6,7 @@ SEL="${ROUTER_EGRESS_SELECTOR_FILE:-/etc/router-wgpay-selector.d/peers.conf}"
 APPLY="${ROUTER_EGRESS_SELECTOR_APPLY:-/usr/local/sbin/router-wgpay-canary-apply.sh}"
 STATE_DIR="${ROUTER_EGRESS_STATE_DIR:-/var/lib/router-wgpay-egress}"
 STATE_FILE="${ROUTER_EGRESS_STATE_FILE:-${STATE_DIR}/state.kv}"
+SELECTOR_LOCK="${ROUTER_EGRESS_SELECTOR_LOCK:-/var/run/router-wgpay-selector.lock}"
 SYN_ACTIVE_IPS="$(echo "${ROUTER_EGRESS_SYNTHETIC_ACTIVE_IPS:-}" | tr ',' ' ')"
 
 ACTIVE_MIN_PACKETS="${ROUTER_EGRESS_ACTIVE_MIN_PACKETS:-10}"
@@ -80,6 +81,25 @@ safe_delta() {
 if [ "$MODE" != "--dry-run" ] && [ "$MODE" != "--apply-preview" ] && [ "$MODE" != "--state-preview" ] && [ "$MODE" != "--state-write" ] && [ "$MODE" != "--commit" ]; then
   echo "Usage: $0 --dry-run|--apply-preview|--state-preview|--state-write|--commit" >&2
   exit 64
+fi
+
+if [ "$MODE" = "--state-write" ] || [ "$MODE" = "--commit" ]; then
+  mkdir -p "$(dirname "$SELECTOR_LOCK")" || exit 70
+  exec 9>"$SELECTOR_LOCK"
+  if ! flock -n 9; then
+    printf '%s\n' \
+      '{' \
+      '  "schema": "router-wgpay-egress-local-v7",' \
+      "  \"mode\": \"$MODE\"," \
+      '  "summary": {' \
+      '    "blocked": true,' \
+      '    "block_reason": "selector_operation_locked",' \
+      '    "action_count": 0,' \
+      '    "noop": true' \
+      '  }' \
+      '}'
+    exit 75
+  fi
 fi
 
 TMP="/tmp/router-wgpay-egress-local-rows.$$"

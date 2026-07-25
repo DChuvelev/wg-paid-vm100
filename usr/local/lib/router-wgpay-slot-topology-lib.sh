@@ -228,3 +228,88 @@ router_topology_increment_count() {
         END {if(!changed) print key OFS value}
     ' "$router_topology_inc_file" > "${router_topology_inc_file}.tmp.$$" && mv "${router_topology_inc_file}.tmp.$$" "$router_topology_inc_file"
 }
+
+router_topology_build_selector_candidate() {
+    router_topology_candidate_selector="$1"
+    router_topology_candidate_moves="$2"
+    router_topology_candidate_output="$3"
+    awk -F '\t' '
+        NR==FNR {
+            if (NF != 3 || seen[$1]++) exit 51;
+            to_class[$1]=$2;
+            to_target[$1]=$3;
+            next;
+        }
+        /^[[:space:]]*($|#)/ {print; next}
+        {
+            split($0,fields,/[[:space:]]+/);
+            ip=fields[1];
+            if (ip in to_class) {
+                print ip " " to_class[ip] " " to_target[ip];
+                applied[ip]++;
+            } else {
+                print;
+            }
+        }
+        END {
+            for (ip in to_class) if (applied[ip] != 1) exit 52;
+        }
+    ' "$router_topology_candidate_moves" "$router_topology_candidate_selector" > "$router_topology_candidate_output"
+}
+
+router_topology_count_exhausted_rows() {
+    router_topology_exhausted_rows_file="$1"
+    router_topology_exhausted_csv="$2"
+    awk -F '\t' -v exhausted="$router_topology_exhausted_csv" '
+        function has(csv,item, a,n,i){
+            if(csv=="") return 0;
+            n=split(csv,a,",");
+            for(i=1;i<=n;i++) if(a[i]==item) return 1;
+            return 0;
+        }
+        has(exhausted,$3){n++}
+        END{print n+0}
+    ' "$router_topology_exhausted_rows_file"
+}
+
+router_topology_restore_file_state() {
+    router_topology_restore_existed="$1"
+    router_topology_restore_backup="$2"
+    router_topology_restore_destination="$3"
+    router_topology_restore_mode="${4:-600}"
+    if [ "$router_topology_restore_existed" = true ]; then
+        router_topology_atomic_write "$router_topology_restore_backup" "$router_topology_restore_destination" "$router_topology_restore_mode"
+    else
+        rm -f "$router_topology_restore_destination"
+    fi
+}
+
+router_topology_verify_selector_runtime() {
+    router_topology_verify_selector="$1"
+    router_topology_verify_table="$2"
+    router_topology_verify_expected_count="$3"
+    router_topology_verify_exhausted_csv="$4"
+    router_topology_verify_workdir="$5"
+    router_topology_verify_rows="$router_topology_verify_workdir/verify-rows.tsv"
+    router_topology_verify_dump="$router_topology_verify_workdir/nft-dump.txt"
+
+    router_topology_selector_to_rows "$router_topology_verify_selector" "$router_topology_verify_rows" || return 1
+    router_topology_verify_count="$(awk 'END{print NR+0}' "$router_topology_verify_rows")"
+    [ "$router_topology_verify_count" -eq "$router_topology_verify_expected_count" ] || return 2
+    router_topology_verify_remaining="$(router_topology_count_exhausted_rows "$router_topology_verify_rows" "$router_topology_verify_exhausted_csv")"
+    [ "$router_topology_verify_remaining" -eq 0 ] || return 3
+
+    if [ -n "${ROUTER_TOPOLOGY_VERIFY_COMMAND:-}" ]; then
+        "$ROUTER_TOPOLOGY_VERIFY_COMMAND" "$router_topology_verify_selector" "$router_topology_verify_table" "$router_topology_verify_expected_count" || return 4
+        return 0
+    fi
+
+    nft list table inet "$router_topology_verify_table" > "$router_topology_verify_dump" 2>&1 || return 5
+    router_topology_verify_seen=0
+    while IFS="$(printf '\t')" read -r router_topology_verify_sortkey router_topology_verify_ip router_topology_verify_class router_topology_verify_tag; do
+        grep -F "ip saddr ${router_topology_verify_ip} ip dscp set ${router_topology_verify_class}" "$router_topology_verify_dump" >/dev/null 2>&1 || return 6
+        router_topology_verify_seen=$((router_topology_verify_seen + 1))
+    done < "$router_topology_verify_rows"
+    [ "$router_topology_verify_seen" -eq "$router_topology_verify_expected_count" ] || return 7
+    return 0
+}

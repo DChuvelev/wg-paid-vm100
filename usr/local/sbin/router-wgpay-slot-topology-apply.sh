@@ -10,7 +10,7 @@ TOPOLOGY_STATE_DIR="${ROUTER_TOPOLOGY_STATE_DIR:-/var/lib/router-wgpay-topology}
 TOPOLOGY_STATE_FILE="${ROUTER_TOPOLOGY_STATE_FILE:-${TOPOLOGY_STATE_DIR}/state.kv}"
 TOPOLOGY_PLAN_FILE="${ROUTER_TOPOLOGY_PLAN_FILE:-${TOPOLOGY_STATE_DIR}/plan.kv}"
 TOPOLOGY_ACK_FILE="${ROUTER_TOPOLOGY_ACK_FILE:-${TOPOLOGY_STATE_DIR}/ack.kv}"
-TOPOLOGY_LOCK_FILE="${ROUTER_TOPOLOGY_LOCK_FILE:-/var/run/router-wgpay-slot-topology.lock}"
+TOPOLOGY_LOCK_FILE="${ROUTER_TOPOLOGY_LOCK_FILE:-/var/run/router-wgpay-selector.lock}"
 TOPOLOGY_NOW_EPOCH="${ROUTER_TOPOLOGY_NOW_EPOCH:-$(date +%s)}"
 
 [ -r "$TOPOLOGY_CONFIG" ] || { echo 'RESULT=STOP_TOPOLOGY_CONFIG_MISSING'; exit 70; }
@@ -19,6 +19,16 @@ TOPOLOGY_NOW_EPOCH="${ROUTER_TOPOLOGY_NOW_EPOCH:-$(date +%s)}"
 . "$TOPOLOGY_CONFIG"
 # shellcheck disable=SC1090
 . "$TOPOLOGY_LIB"
+
+# Re-resolve dependent paths after configuration load while preserving explicit environment overrides.
+TOPOLOGY_SELECTOR_FILE="${ROUTER_TOPOLOGY_SELECTOR_FILE:-${TOPOLOGY_SELECTOR_FILE:-/etc/router-wgpay-selector.d/peers.conf}}"
+TOPOLOGY_SELECTOR_APPLY="${ROUTER_TOPOLOGY_SELECTOR_APPLY:-${TOPOLOGY_SELECTOR_APPLY:-/usr/local/sbin/router-wgpay-canary-apply.sh}}"
+TOPOLOGY_SELECTOR_TABLE="${ROUTER_TOPOLOGY_SELECTOR_TABLE:-${TOPOLOGY_SELECTOR_TABLE:-wgpay_dscp_canary}}"
+TOPOLOGY_STATE_DIR="${ROUTER_TOPOLOGY_STATE_DIR:-${TOPOLOGY_STATE_DIR:-/var/lib/router-wgpay-topology}}"
+TOPOLOGY_STATE_FILE="${ROUTER_TOPOLOGY_STATE_FILE:-${TOPOLOGY_STATE_DIR}/state.kv}"
+TOPOLOGY_PLAN_FILE="${ROUTER_TOPOLOGY_PLAN_FILE:-${TOPOLOGY_STATE_DIR}/plan.kv}"
+TOPOLOGY_ACK_FILE="${ROUTER_TOPOLOGY_ACK_FILE:-${TOPOLOGY_STATE_DIR}/ack.kv}"
+TOPOLOGY_LOCK_FILE="${ROUTER_TOPOLOGY_LOCK_FILE:-${TOPOLOGY_LOCK_FILE:-/var/run/router-wgpay-selector.lock}}"
 
 case "${1:---stdin}" in
     --status)
@@ -40,11 +50,54 @@ TOPOLOGY_EXPECTED="$TOPOLOGY_TMP_ROOT/expected.kv"
 TOPOLOGY_ROWS="$TOPOLOGY_TMP_ROOT/selector-rows.tsv"
 TOPOLOGY_COUNTS="$TOPOLOGY_TMP_ROOT/counts.kv"
 TOPOLOGY_MOVES="$TOPOLOGY_TMP_ROOT/moves.kv"
+TOPOLOGY_MOVE_MAP="$TOPOLOGY_TMP_ROOT/move-map.tsv"
+TOPOLOGY_CANDIDATE="$TOPOLOGY_TMP_ROOT/selector.candidate"
+TOPOLOGY_CANDIDATE_ROWS="$TOPOLOGY_TMP_ROOT/selector-candidate-rows.tsv"
+TOPOLOGY_APPLY_LOG="$TOPOLOGY_TMP_ROOT/selector-apply.log"
+TOPOLOGY_ROLLBACK_LOG="$TOPOLOGY_TMP_ROOT/rollback.log"
+TOPOLOGY_TXN_DIR="$TOPOLOGY_TMP_ROOT/transaction"
 TOPOLOGY_PLAN_TMP="$TOPOLOGY_TMP_ROOT/plan.kv"
 TOPOLOGY_STATE_TMP="$TOPOLOGY_TMP_ROOT/state.kv"
 TOPOLOGY_ACK_TMP="$TOPOLOGY_TMP_ROOT/ack.kv"
-trap 'rm -rf "$TOPOLOGY_TMP_ROOT"' EXIT HUP INT TERM
-mkdir -p "$TOPOLOGY_TMP_ROOT" || exit 70
+TOPOLOGY_TXN_ACTIVE=false
+TOPOLOGY_TXN_COMMITTED=false
+TOPOLOGY_SELECTOR_CHANGED=false
+TOPOLOGY_OLD_STATE_EXISTED=false
+TOPOLOGY_OLD_PLAN_EXISTED=false
+TOPOLOGY_OLD_ACK_EXISTED=false
+
+router_topology_transaction_rollback() {
+    router_topology_rb_rc=0
+    if [ "$TOPOLOGY_SELECTOR_CHANGED" = true ] && [ -f "$TOPOLOGY_TXN_DIR/selector.before" ]; then
+        router_topology_atomic_write "$TOPOLOGY_TXN_DIR/selector.before" "$TOPOLOGY_SELECTOR_FILE" 600 || router_topology_rb_rc=1
+        if [ "$router_topology_rb_rc" -eq 0 ]; then
+            "$TOPOLOGY_SELECTOR_APPLY" start >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
+        fi
+        if [ "$router_topology_rb_rc" -eq 0 ]; then
+            mkdir -p "$TOPOLOGY_TMP_ROOT/rollback-verify" || router_topology_rb_rc=1
+        fi
+        if [ "$router_topology_rb_rc" -eq 0 ]; then
+            router_topology_verify_selector_runtime "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_SELECTOR_TABLE" "${TOPOLOGY_peer_count:-0}" '' "$TOPOLOGY_TMP_ROOT/rollback-verify" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
+        fi
+    fi
+    router_topology_restore_file_state "$TOPOLOGY_OLD_STATE_EXISTED" "$TOPOLOGY_TXN_DIR/state.before" "$TOPOLOGY_STATE_FILE" 600 || router_topology_rb_rc=1
+    router_topology_restore_file_state "$TOPOLOGY_OLD_PLAN_EXISTED" "$TOPOLOGY_TXN_DIR/plan.before" "$TOPOLOGY_PLAN_FILE" 600 || router_topology_rb_rc=1
+    router_topology_restore_file_state "$TOPOLOGY_OLD_ACK_EXISTED" "$TOPOLOGY_TXN_DIR/ack.before" "$TOPOLOGY_ACK_FILE" 600 || router_topology_rb_rc=1
+    TOPOLOGY_TXN_ACTIVE=false
+    return "$router_topology_rb_rc"
+}
+
+router_topology_cleanup() {
+    router_topology_cleanup_rc="$1"
+    trap - EXIT HUP INT TERM
+    if [ "$TOPOLOGY_TXN_ACTIVE" = true ] && [ "$TOPOLOGY_TXN_COMMITTED" != true ]; then
+        router_topology_transaction_rollback >/dev/null 2>&1 || true
+    fi
+    rm -rf "$TOPOLOGY_TMP_ROOT"
+    exit "$router_topology_cleanup_rc"
+}
+trap 'router_topology_cleanup $?' EXIT HUP INT TERM
+mkdir -p "$TOPOLOGY_TMP_ROOT" "$TOPOLOGY_TXN_DIR" || exit 70
 
 # Read no more than the contract limit plus one byte.
 dd bs=$((TOPOLOGY_INPUT_MAX_BYTES + 1)) count=1 of="$TOPOLOGY_RAW" 2>/dev/null
@@ -168,6 +221,7 @@ for TOPOLOGY_cls in cs1 cs2 cs3 cs4 cs5; do
     printf 'counts.after.%s=%s\n' "$TOPOLOGY_cls" "$TOPOLOGY_cls_count" >> "$TOPOLOGY_COUNTS"
 done
 : > "$TOPOLOGY_MOVES"
+: > "$TOPOLOGY_MOVE_MAP"
 TOPOLOGY_moved=0
 TOPOLOGY_remaining=0
 TOPOLOGY_result=PLANNED
@@ -189,6 +243,7 @@ elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ]; then
         printf 'move.%s.from_target=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_from_tag" >> "$TOPOLOGY_MOVES"
         printf 'move.%s.to_selector=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_to_cls" >> "$TOPOLOGY_MOVES"
         printf 'move.%s.to_target=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_to_tag" >> "$TOPOLOGY_MOVES"
+        printf '%s\t%s\t%s\n' "$TOPOLOGY_ip" "$TOPOLOGY_to_cls" "$TOPOLOGY_to_tag" >> "$TOPOLOGY_MOVE_MAP"
         router_topology_increment_count "$TOPOLOGY_COUNTS" "counts.after.${TOPOLOGY_to_cls}" || exit 72
         router_topology_decrement_count "$TOPOLOGY_COUNTS" "counts.after.${TOPOLOGY_from_cls}" || exit 72
     done < "$TOPOLOGY_ROWS"
@@ -213,9 +268,117 @@ fi
 } > "$TOPOLOGY_PLAN_TMP"
 TOPOLOGY_plan_sha="$(sha256sum "$TOPOLOGY_PLAN_TMP" | awk '{print $1}')"
 
+router_topology_emit_failed_ack() {
+    router_topology_fail_reason="$1"
+    router_topology_fail_detail="$(router_topology_sanitize_detail "${2:-}")"
+    router_topology_fail_rollback_performed="$3"
+    router_topology_fail_rollback_result="$4"
+    printf '%s\n' \
+        "schema=${TOPOLOGY_ACK_SCHEMA}" \
+        'result=FAILED' \
+        "reason=${router_topology_fail_reason}" \
+        "detail=${router_topology_fail_detail}" \
+        "attempted_generation=${TOPOLOGY_msg_generation}" \
+        "payload_sha256=${TOPOLOGY_payload_sha}" \
+        "rollback_performed=${router_topology_fail_rollback_performed}" \
+        "rollback_result=${router_topology_fail_rollback_result}"
+}
+
+router_topology_snapshot_previous_file() {
+    router_topology_snapshot_src="$1"
+    router_topology_snapshot_dst="$2"
+    router_topology_snapshot_flag="$3"
+    if [ -f "$router_topology_snapshot_src" ]; then
+        cp "$router_topology_snapshot_src" "$router_topology_snapshot_dst" || return 1
+        eval "$router_topology_snapshot_flag=true"
+    else
+        : > "$router_topology_snapshot_dst"
+        eval "$router_topology_snapshot_flag=false"
+    fi
+}
+
+if [ "$TOPOLOGY_TXN_ACTIVE" != true ]; then
+    router_topology_snapshot_previous_file "$TOPOLOGY_STATE_FILE" "$TOPOLOGY_TXN_DIR/state.before" TOPOLOGY_OLD_STATE_EXISTED || exit 76
+    router_topology_snapshot_previous_file "$TOPOLOGY_PLAN_FILE" "$TOPOLOGY_TXN_DIR/plan.before" TOPOLOGY_OLD_PLAN_EXISTED || exit 76
+    router_topology_snapshot_previous_file "$TOPOLOGY_ACK_FILE" "$TOPOLOGY_TXN_DIR/ack.before" TOPOLOGY_OLD_ACK_EXISTED || exit 76
+    TOPOLOGY_TXN_ACTIVE=true
+fi
+
+TOPOLOGY_selector_sha_after="$TOPOLOGY_selector_sha"
+TOPOLOGY_apply_performed=false
+TOPOLOGY_exhausted_remaining="$TOPOLOGY_remaining"
+TOPOLOGY_final_result=PASS
+
+if [ "$TOPOLOGY_result" = DIRECT_REQUIRED ]; then
+    TOPOLOGY_final_result=DIRECT_REQUIRED
+elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ]; then
+    router_topology_build_selector_candidate "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_MOVE_MAP" "$TOPOLOGY_CANDIDATE" || {
+        router_topology_emit_failed_ack selector_candidate_build_failed candidate false NOT_REQUIRED
+        exit 74
+    }
+    router_topology_selector_to_rows "$TOPOLOGY_CANDIDATE" "$TOPOLOGY_CANDIDATE_ROWS" || {
+        router_topology_emit_failed_ack selector_candidate_parse_failed candidate false NOT_REQUIRED
+        exit 74
+    }
+    TOPOLOGY_candidate_count="$(awk 'END{print NR+0}' "$TOPOLOGY_CANDIDATE_ROWS")"
+    [ "$TOPOLOGY_candidate_count" -eq "$TOPOLOGY_peer_count" ] || {
+        router_topology_emit_failed_ack selector_candidate_peer_count_mismatch "$TOPOLOGY_candidate_count" false NOT_REQUIRED
+        exit 74
+    }
+    TOPOLOGY_exhausted_remaining="$(router_topology_count_exhausted_rows "$TOPOLOGY_CANDIDATE_ROWS" "$TOPOLOGY_msg_exhausted_selectors")"
+    [ "$TOPOLOGY_exhausted_remaining" -eq 0 ] || {
+        router_topology_emit_failed_ack selector_candidate_exhausted_rows_remaining "$TOPOLOGY_exhausted_remaining" false NOT_REQUIRED
+        exit 74
+    }
+    TOPOLOGY_selector_sha_after="$(sha256sum "$TOPOLOGY_CANDIDATE" | awk '{print $1}')"
+
+    cp "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_TXN_DIR/selector.before" || {
+        router_topology_emit_failed_ack selector_backup_failed selector false NOT_REQUIRED
+        exit 76
+    }
+    if [ "${ROUTER_TOPOLOGY_TEST_FAULT:-}" = selector_write ]; then
+        router_topology_emit_failed_ack selector_write_failed injected false NOT_REQUIRED
+        TOPOLOGY_TXN_ACTIVE=false
+        exit 77
+    fi
+    router_topology_atomic_write "$TOPOLOGY_CANDIDATE" "$TOPOLOGY_SELECTOR_FILE" 600 || {
+        router_topology_emit_failed_ack selector_write_failed atomic false NOT_REQUIRED
+        TOPOLOGY_TXN_ACTIVE=false
+        exit 77
+    }
+    TOPOLOGY_SELECTOR_CHANGED=true
+
+    if [ "${ROUTER_TOPOLOGY_TEST_FAULT:-}" = selector_apply ]; then
+        TOPOLOGY_apply_rc=91
+    else
+        "$TOPOLOGY_SELECTOR_APPLY" start > "$TOPOLOGY_APPLY_LOG" 2>&1
+        TOPOLOGY_apply_rc=$?
+    fi
+    if [ "$TOPOLOGY_apply_rc" -ne 0 ]; then
+        if router_topology_transaction_rollback; then TOPOLOGY_rb=PASS; else TOPOLOGY_rb=FAILED; fi
+        router_topology_emit_failed_ack selector_apply_failed "$TOPOLOGY_apply_rc" true "$TOPOLOGY_rb"
+        [ "$TOPOLOGY_rb" = PASS ] && exit 78 || exit 79
+    fi
+    TOPOLOGY_apply_performed=true
+
+    if [ "${ROUTER_TOPOLOGY_TEST_FAULT:-}" = verify ]; then
+        TOPOLOGY_verify_rc=92
+    else
+        mkdir -p "$TOPOLOGY_TMP_ROOT/verify"
+        router_topology_verify_selector_runtime "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_SELECTOR_TABLE" "$TOPOLOGY_peer_count" "$TOPOLOGY_msg_exhausted_selectors" "$TOPOLOGY_TMP_ROOT/verify"
+        TOPOLOGY_verify_rc=$?
+    fi
+    if [ "$TOPOLOGY_verify_rc" -ne 0 ]; then
+        if router_topology_transaction_rollback; then TOPOLOGY_rb=PASS; else TOPOLOGY_rb=FAILED; fi
+        router_topology_emit_failed_ack selector_verify_failed "$TOPOLOGY_verify_rc" true "$TOPOLOGY_rb"
+        [ "$TOPOLOGY_rb" = PASS ] && exit 80 || exit 81
+    fi
+fi
+
 {
     printf 'schema=%s\n' "$TOPOLOGY_STATE_SCHEMA"
     printf 'accepted_generation=%s\n' "$TOPOLOGY_msg_generation"
+    printf 'applied_generation=%s\n' "$TOPOLOGY_msg_generation"
     printf 'payload_sha256=%s\n' "$TOPOLOGY_payload_sha"
     printf 'mode=%s\n' "$TOPOLOGY_msg_mode"
     printf 'source_vm101_generation=%s\n' "$TOPOLOGY_msg_source_generation"
@@ -225,31 +388,54 @@ TOPOLOGY_plan_sha="$(sha256sum "$TOPOLOGY_PLAN_TMP" | awk '{print $1}')"
     printf 'exhausted_selectors=%s\n' "$TOPOLOGY_msg_exhausted_selectors"
     printf 'created_epoch=%s\n' "$TOPOLOGY_msg_created_epoch"
     printf 'received_epoch=%s\n' "$TOPOLOGY_NOW_EPOCH"
-    printf 'foundation_result=%s\n' "$TOPOLOGY_result"
-    printf 'apply_performed=false\n'
+    printf 'apply_result=%s\n' "$TOPOLOGY_final_result"
+    printf 'apply_performed=%s\n' "$TOPOLOGY_apply_performed"
     printf 'selector_sha256_before=%s\n' "$TOPOLOGY_selector_sha"
+    printf 'selector_sha256=%s\n' "$TOPOLOGY_selector_sha_after"
+    printf 'peer_count=%s\n' "$TOPOLOGY_peer_count"
+    printf 'moved_peer_count=%s\n' "$TOPOLOGY_moved"
+    printf 'exhausted_rows_remaining=%s\n' "$TOPOLOGY_exhausted_remaining"
     printf 'plan_sha256=%s\n' "$TOPOLOGY_plan_sha"
+    for TOPOLOGY_cls in cs1 cs2 cs3 cs4 cs5; do
+        printf 'counts.%s=%s\n' "$TOPOLOGY_cls" "$(router_topology_kv_get "counts.after.${TOPOLOGY_cls}" "$TOPOLOGY_COUNTS")"
+    done
 } > "$TOPOLOGY_STATE_TMP"
 
 {
     printf 'schema=%s\n' "$TOPOLOGY_ACK_SCHEMA"
-    printf 'result=%s\n' "$TOPOLOGY_result"
+    printf 'result=%s\n' "$TOPOLOGY_final_result"
     printf 'accepted_generation=%s\n' "$TOPOLOGY_msg_generation"
-    printf 'applied_generation=000000000000\n'
-    printf 'apply_performed=false\n'
+    printf 'applied_generation=%s\n' "$TOPOLOGY_msg_generation"
+    printf 'apply_performed=%s\n' "$TOPOLOGY_apply_performed"
     printf 'payload_sha256=%s\n' "$TOPOLOGY_payload_sha"
     printf 'selector_sha256_before=%s\n' "$TOPOLOGY_selector_sha"
+    printf 'selector_sha256=%s\n' "$TOPOLOGY_selector_sha_after"
     printf 'plan_sha256=%s\n' "$TOPOLOGY_plan_sha"
     printf 'peer_count=%s\n' "$TOPOLOGY_peer_count"
-    printf 'planned_moved_peer_count=%s\n' "$TOPOLOGY_moved"
-    printf 'planned_exhausted_rows_remaining=%s\n' "$TOPOLOGY_remaining"
+    printf 'moved_peer_count=%s\n' "$TOPOLOGY_moved"
+    printf 'exhausted_rows_remaining=%s\n' "$TOPOLOGY_exhausted_remaining"
+    printf 'rollback_performed=false\n'
+    printf 'rollback_result=NOT_REQUIRED\n'
     for TOPOLOGY_cls in cs1 cs2 cs3 cs4 cs5; do
         printf 'counts.%s=%s\n' "$TOPOLOGY_cls" "$(router_topology_kv_get "counts.after.${TOPOLOGY_cls}" "$TOPOLOGY_COUNTS")"
     done
 } > "$TOPOLOGY_ACK_TMP"
 
-router_topology_atomic_write "$TOPOLOGY_PLAN_TMP" "$TOPOLOGY_PLAN_FILE" 600 || exit 73
-router_topology_atomic_write "$TOPOLOGY_STATE_TMP" "$TOPOLOGY_STATE_FILE" 600 || exit 73
-router_topology_atomic_write "$TOPOLOGY_ACK_TMP" "$TOPOLOGY_ACK_FILE" 600 || exit 73
+router_topology_atomic_write "$TOPOLOGY_PLAN_TMP" "$TOPOLOGY_PLAN_FILE" 600 || TOPOLOGY_persist_rc=1
+: "${TOPOLOGY_persist_rc:=0}"
+[ "$TOPOLOGY_persist_rc" -ne 0 ] || router_topology_atomic_write "$TOPOLOGY_STATE_TMP" "$TOPOLOGY_STATE_FILE" 600 || TOPOLOGY_persist_rc=1
+[ "$TOPOLOGY_persist_rc" -ne 0 ] || router_topology_atomic_write "$TOPOLOGY_ACK_TMP" "$TOPOLOGY_ACK_FILE" 600 || TOPOLOGY_persist_rc=1
+if [ "$TOPOLOGY_persist_rc" -ne 0 ]; then
+    if [ "$TOPOLOGY_TXN_ACTIVE" = true ]; then
+        if router_topology_transaction_rollback; then TOPOLOGY_rb=PASS; else TOPOLOGY_rb=FAILED; fi
+    else
+        TOPOLOGY_rb=NOT_REQUIRED
+    fi
+    router_topology_emit_failed_ack topology_state_persist_failed persist "$TOPOLOGY_apply_performed" "$TOPOLOGY_rb"
+    [ "$TOPOLOGY_rb" != FAILED ] && exit 82 || exit 83
+fi
+
+TOPOLOGY_TXN_COMMITTED=true
+TOPOLOGY_TXN_ACTIVE=false
 cat "$TOPOLOGY_ACK_FILE"
 exit 0
