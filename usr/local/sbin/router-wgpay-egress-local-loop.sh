@@ -17,6 +17,8 @@ ROUTER_EGRESS_FORCE_REASON=""
 ROUTER_EGRESS_FORCE_UNTIL=""
 ROUTER_EGRESS_ACTIVE_MIN_PACKETS="10"
 ROUTER_EGRESS_ACTIVE_MIN_BYTES="16384"
+ROUTER_EGRESS_TOPOLOGY_STATE_FILE="/var/lib/router-wgpay-topology/state.kv"
+ROUTER_EGRESS_MAINTENANCE_OVERRIDE="0"
 
 if [ -f "$CONF" ]; then
   # shellcheck disable=SC1090
@@ -37,10 +39,12 @@ export ROUTER_EGRESS_FORCE_REASON
 export ROUTER_EGRESS_FORCE_UNTIL
 export ROUTER_EGRESS_ACTIVE_MIN_PACKETS
 export ROUTER_EGRESS_ACTIVE_MIN_BYTES
+export ROUTER_EGRESS_TOPOLOGY_STATE_FILE
+export ROUTER_EGRESS_MAINTENANCE_OVERRIDE
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 
-echo "__ROUTER_WGPAY_EGRESS_LOCAL_LOOP_BEGIN__ pid=$$ conf=$CONF mode=$MODE interval=$INTERVAL allocator_enabled=$ROUTER_EGRESS_ALLOCATOR_ENABLED paused=$ROUTER_EGRESS_REBALANCE_PAUSED force_mode=$ROUTER_EGRESS_FORCE_MODE started_at=$(date -Is 2>/dev/null || date)" >> "$LOG"
+echo "__ROUTER_WGPAY_EGRESS_LOCAL_LOOP_BEGIN__ pid=$$ conf=$CONF mode=$MODE interval=$INTERVAL allocator_enabled=$ROUTER_EGRESS_ALLOCATOR_ENABLED paused=$ROUTER_EGRESS_REBALANCE_PAUSED force_mode=$ROUTER_EGRESS_FORCE_MODE topology_state=$ROUTER_EGRESS_TOPOLOGY_STATE_FILE maintenance_override=$ROUTER_EGRESS_MAINTENANCE_OVERRIDE started_at=$(date -Is 2>/dev/null || date)" >> "$LOG"
 
 while true; do
   {
@@ -52,6 +56,8 @@ while true; do
     echo "allocator_enabled=$ROUTER_EGRESS_ALLOCATOR_ENABLED"
     echo "rebalance_paused=$ROUTER_EGRESS_REBALANCE_PAUSED"
     echo "force_mode=$ROUTER_EGRESS_FORCE_MODE"
+    echo "topology_state_file=$ROUTER_EGRESS_TOPOLOGY_STATE_FILE"
+    echo "maintenance_override=$ROUTER_EGRESS_MAINTENANCE_OVERRIDE"
     "$SCRIPT" "$MODE"
     rc=$?
     echo "run_rc=$rc"
