@@ -29,6 +29,8 @@ TOPOLOGY_STATE_FILE="${ROUTER_TOPOLOGY_STATE_FILE:-${TOPOLOGY_STATE_DIR}/state.k
 TOPOLOGY_PLAN_FILE="${ROUTER_TOPOLOGY_PLAN_FILE:-${TOPOLOGY_STATE_DIR}/plan.kv}"
 TOPOLOGY_ACK_FILE="${ROUTER_TOPOLOGY_ACK_FILE:-${TOPOLOGY_STATE_DIR}/ack.kv}"
 TOPOLOGY_LOCK_FILE="${ROUTER_TOPOLOGY_LOCK_FILE:-${TOPOLOGY_LOCK_FILE:-/var/run/router-wgpay-selector.lock}}"
+TOPOLOGY_DIRECT_MODE_HELPER="${ROUTER_TOPOLOGY_DIRECT_MODE_HELPER:-${TOPOLOGY_DIRECT_MODE_HELPER:-/usr/local/sbin/router-wgpay-direct-mode.sh}}"
+TOPOLOGY_DIRECT_POLICY_ENABLED="${ROUTER_TOPOLOGY_DIRECT_POLICY_ENABLED:-${TOPOLOGY_DIRECT_POLICY_ENABLED:-0}}"
 
 case "${1:---stdin}" in
     --status)
@@ -62,6 +64,7 @@ TOPOLOGY_ACK_TMP="$TOPOLOGY_TMP_ROOT/ack.kv"
 TOPOLOGY_TXN_ACTIVE=false
 TOPOLOGY_TXN_COMMITTED=false
 TOPOLOGY_SELECTOR_CHANGED=false
+TOPOLOGY_DIRECT_CHANGED=false
 TOPOLOGY_OLD_STATE_EXISTED=false
 TOPOLOGY_OLD_PLAN_EXISTED=false
 TOPOLOGY_OLD_ACK_EXISTED=false
@@ -79,6 +82,9 @@ router_topology_transaction_rollback() {
         if [ "$router_topology_rb_rc" -eq 0 ]; then
             router_topology_verify_selector_runtime "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_SELECTOR_TABLE" "${TOPOLOGY_peer_count:-0}" '' "$TOPOLOGY_TMP_ROOT/rollback-verify" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
         fi
+    fi
+    if [ "$TOPOLOGY_DIRECT_CHANGED" = true ] && [ -x "$TOPOLOGY_DIRECT_MODE_HELPER" ]; then
+        ROUTER_WGPAY_DIRECT_CONFIG="$TOPOLOGY_CONFIG" "$TOPOLOGY_DIRECT_MODE_HELPER" --disable topology_transaction_rollback "$TOPOLOGY_msg_source_generation" "$TOPOLOGY_msg_generation" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
     fi
     router_topology_restore_file_state "$TOPOLOGY_OLD_STATE_EXISTED" "$TOPOLOGY_TXN_DIR/state.before" "$TOPOLOGY_STATE_FILE" 600 || router_topology_rb_rc=1
     router_topology_restore_file_state "$TOPOLOGY_OLD_PLAN_EXISTED" "$TOPOLOGY_TXN_DIR/plan.before" "$TOPOLOGY_PLAN_FILE" 600 || router_topology_rb_rc=1
@@ -310,6 +316,26 @@ TOPOLOGY_exhausted_remaining="$TOPOLOGY_remaining"
 TOPOLOGY_final_result=PASS
 
 if [ "$TOPOLOGY_result" = DIRECT_REQUIRED ]; then
+    [ -x "$TOPOLOGY_DIRECT_MODE_HELPER" ] || {
+        router_topology_emit_failed_ack direct_helper_missing "$TOPOLOGY_DIRECT_MODE_HELPER" false NOT_REQUIRED
+        exit 73
+    }
+    TOPOLOGY_DIRECT_LOG="$TOPOLOGY_TMP_ROOT/direct-mode.log"
+    ROUTER_WGPAY_DIRECT_CONFIG="$TOPOLOGY_CONFIG" ROUTER_WGPAY_DIRECT_POLICY_ENABLED="$TOPOLOGY_DIRECT_POLICY_ENABLED" "$TOPOLOGY_DIRECT_MODE_HELPER" --request DIRECT_REQUIRED "$TOPOLOGY_msg_source_generation" "$TOPOLOGY_msg_generation" > "$TOPOLOGY_DIRECT_LOG" 2>&1
+    TOPOLOGY_direct_rc=$?
+    if [ "$TOPOLOGY_direct_rc" -ne 0 ]; then
+        router_topology_emit_failed_ack direct_helper_failed "$TOPOLOGY_direct_rc" false NOT_REQUIRED
+        cat "$TOPOLOGY_DIRECT_LOG" >&2
+        exit 73
+    fi
+    TOPOLOGY_direct_result="$(awk -F= '$1=="RESULT"{print substr($0,index($0,"=")+1)}' "$TOPOLOGY_DIRECT_LOG" | tail -n1)"
+    TOPOLOGY_direct_changed="$(awk -F= '$1=="DIRECT_MODE_CHANGED"{print substr($0,index($0,"=")+1)}' "$TOPOLOGY_DIRECT_LOG" | tail -n1)"
+    case "$TOPOLOGY_direct_result" in NOOP_DIRECT_POLICY_DISABLED|NOOP_DIRECT_ALREADY_ACTIVE|PASS_DIRECT_MODE_ENABLED) ;; *)
+        router_topology_emit_failed_ack direct_helper_result_invalid "$TOPOLOGY_direct_result" false NOT_REQUIRED
+        exit 73
+        ;;
+    esac
+    [ "$TOPOLOGY_direct_changed" = true ] && TOPOLOGY_DIRECT_CHANGED=true
     TOPOLOGY_final_result=DIRECT_REQUIRED
 elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ]; then
     router_topology_build_selector_candidate "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_MOVE_MAP" "$TOPOLOGY_CANDIDATE" || {
@@ -389,6 +415,8 @@ fi
     printf 'created_epoch=%s\n' "$TOPOLOGY_msg_created_epoch"
     printf 'received_epoch=%s\n' "$TOPOLOGY_NOW_EPOCH"
     printf 'apply_result=%s\n' "$TOPOLOGY_final_result"
+    printf 'direct_policy_enabled=%s\n' "$TOPOLOGY_DIRECT_POLICY_ENABLED"
+    printf 'direct_request_result=%s\n' "${TOPOLOGY_direct_result:-NOT_REQUESTED}"
     printf 'apply_performed=%s\n' "$TOPOLOGY_apply_performed"
     printf 'selector_sha256_before=%s\n' "$TOPOLOGY_selector_sha"
     printf 'selector_sha256=%s\n' "$TOPOLOGY_selector_sha_after"
@@ -404,6 +432,8 @@ fi
 {
     printf 'schema=%s\n' "$TOPOLOGY_ACK_SCHEMA"
     printf 'result=%s\n' "$TOPOLOGY_final_result"
+    printf 'direct_policy_enabled=%s\n' "$TOPOLOGY_DIRECT_POLICY_ENABLED"
+    printf 'direct_request_result=%s\n' "${TOPOLOGY_direct_result:-NOT_REQUESTED}"
     printf 'accepted_generation=%s\n' "$TOPOLOGY_msg_generation"
     printf 'applied_generation=%s\n' "$TOPOLOGY_msg_generation"
     printf 'apply_performed=%s\n' "$TOPOLOGY_apply_performed"
