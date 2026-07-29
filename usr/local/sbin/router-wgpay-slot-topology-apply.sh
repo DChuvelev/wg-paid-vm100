@@ -6,6 +6,7 @@ export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 TOPOLOGY_CONFIG="${ROUTER_TOPOLOGY_CONFIG:-/etc/router-wgpay-slot-topology.conf}"
 TOPOLOGY_LIB="${ROUTER_TOPOLOGY_LIB:-/usr/local/lib/router-wgpay-slot-topology-lib.sh}"
 TOPOLOGY_SELECTOR_FILE="${ROUTER_TOPOLOGY_SELECTOR_FILE:-/etc/router-wgpay-selector.d/peers.conf}"
+TOPOLOGY_CANONICAL_SELECTOR_FILE="${ROUTER_TOPOLOGY_CANONICAL_SELECTOR_FILE:-/etc/router-wgpay-selector.d/canonical.conf}"
 TOPOLOGY_STATE_DIR="${ROUTER_TOPOLOGY_STATE_DIR:-/var/lib/router-wgpay-topology}"
 TOPOLOGY_STATE_FILE="${ROUTER_TOPOLOGY_STATE_FILE:-${TOPOLOGY_STATE_DIR}/state.kv}"
 TOPOLOGY_PLAN_FILE="${ROUTER_TOPOLOGY_PLAN_FILE:-${TOPOLOGY_STATE_DIR}/plan.kv}"
@@ -22,6 +23,7 @@ TOPOLOGY_NOW_EPOCH="${ROUTER_TOPOLOGY_NOW_EPOCH:-$(date +%s)}"
 
 # Re-resolve dependent paths after configuration load while preserving explicit environment overrides.
 TOPOLOGY_SELECTOR_FILE="${ROUTER_TOPOLOGY_SELECTOR_FILE:-${TOPOLOGY_SELECTOR_FILE:-/etc/router-wgpay-selector.d/peers.conf}}"
+TOPOLOGY_CANONICAL_SELECTOR_FILE="${ROUTER_TOPOLOGY_CANONICAL_SELECTOR_FILE:-${TOPOLOGY_CANONICAL_SELECTOR_FILE:-/etc/router-wgpay-selector.d/canonical.conf}}"
 TOPOLOGY_SELECTOR_APPLY="${ROUTER_TOPOLOGY_SELECTOR_APPLY:-${TOPOLOGY_SELECTOR_APPLY:-/usr/local/sbin/router-wgpay-canary-apply.sh}}"
 TOPOLOGY_SELECTOR_TABLE="${ROUTER_TOPOLOGY_SELECTOR_TABLE:-${TOPOLOGY_SELECTOR_TABLE:-wgpay_dscp_canary}}"
 TOPOLOGY_STATE_DIR="${ROUTER_TOPOLOGY_STATE_DIR:-${TOPOLOGY_STATE_DIR:-/var/lib/router-wgpay-topology}}"
@@ -56,6 +58,9 @@ TOPOLOGY_RAW="$TOPOLOGY_TMP_ROOT/input.kv"
 TOPOLOGY_BODY="$TOPOLOGY_TMP_ROOT/body.kv"
 TOPOLOGY_EXPECTED="$TOPOLOGY_TMP_ROOT/expected.kv"
 TOPOLOGY_ROWS="$TOPOLOGY_TMP_ROOT/selector-rows.tsv"
+TOPOLOGY_CANONICAL_ROWS="$TOPOLOGY_TMP_ROOT/canonical-selector-rows.tsv"
+TOPOLOGY_CURRENT_IPS="$TOPOLOGY_TMP_ROOT/current-ips.txt"
+TOPOLOGY_CANONICAL_IPS="$TOPOLOGY_TMP_ROOT/canonical-ips.txt"
 TOPOLOGY_COUNTS="$TOPOLOGY_TMP_ROOT/counts.kv"
 TOPOLOGY_MOVES="$TOPOLOGY_TMP_ROOT/moves.kv"
 TOPOLOGY_MOVE_MAP="$TOPOLOGY_TMP_ROOT/move-map.tsv"
@@ -303,6 +308,36 @@ elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ]; then
         router_topology_increment_count "$TOPOLOGY_COUNTS" "counts.after.${TOPOLOGY_to_cls}" || exit 72
         router_topology_decrement_count "$TOPOLOGY_COUNTS" "counts.after.${TOPOLOGY_from_cls}" || exit 72
     done < "$TOPOLOGY_ROWS"
+elif [ "$TOPOLOGY_msg_mode" = NORMAL ]; then
+    [ -r "$TOPOLOGY_CANONICAL_SELECTOR_FILE" ] || { router_topology_reject canonical_selector_missing "$TOPOLOGY_CANONICAL_SELECTOR_FILE" 72; exit $?; }
+    router_topology_selector_to_rows "$TOPOLOGY_CANONICAL_SELECTOR_FILE" "$TOPOLOGY_CANONICAL_ROWS" || { router_topology_reject canonical_selector_parse_failed "$TOPOLOGY_CANONICAL_SELECTOR_FILE" 72; exit $?; }
+    TOPOLOGY_canonical_count="$(awk 'END{print NR+0}' "$TOPOLOGY_CANONICAL_ROWS")"
+    [ "$TOPOLOGY_canonical_count" -eq "$TOPOLOGY_peer_count" ] || { router_topology_reject canonical_selector_peer_count_mismatch "$TOPOLOGY_canonical_count" 72; exit $?; }
+    awk -F '\t' '{print $2}' "$TOPOLOGY_ROWS" > "$TOPOLOGY_CURRENT_IPS"
+    awk -F '\t' '{print $2}' "$TOPOLOGY_CANONICAL_ROWS" > "$TOPOLOGY_CANONICAL_IPS"
+    cmp -s "$TOPOLOGY_CURRENT_IPS" "$TOPOLOGY_CANONICAL_IPS" || { router_topology_reject canonical_selector_peer_set_mismatch peers 72; exit $?; }
+    while IFS="$(printf '\t')" read -r TOPOLOGY_sortkey TOPOLOGY_ip TOPOLOGY_from_cls TOPOLOGY_from_tag; do
+        TOPOLOGY_to_cls="$(awk -F '\t' -v ip="$TOPOLOGY_ip" '$2==ip{print $3}' "$TOPOLOGY_CANONICAL_ROWS")"
+        TOPOLOGY_to_tag="$(awk -F '\t' -v ip="$TOPOLOGY_ip" '$2==ip{print $4}' "$TOPOLOGY_CANONICAL_ROWS")"
+        [ -n "$TOPOLOGY_to_cls" ] && [ -n "$TOPOLOGY_to_tag" ] || { router_topology_reject canonical_selector_peer_missing "$TOPOLOGY_ip" 72; exit $?; }
+        if [ "$TOPOLOGY_from_cls" != "$TOPOLOGY_to_cls" ] || [ "$TOPOLOGY_from_tag" != "$TOPOLOGY_to_tag" ]; then
+            TOPOLOGY_moved=$((TOPOLOGY_moved + 1))
+            TOPOLOGY_move_index="$(printf '%04d' "$TOPOLOGY_moved")"
+            printf 'move.%s.tunnel_ip=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_ip" >> "$TOPOLOGY_MOVES"
+            printf 'move.%s.from_selector=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_from_cls" >> "$TOPOLOGY_MOVES"
+            printf 'move.%s.from_target=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_from_tag" >> "$TOPOLOGY_MOVES"
+            printf 'move.%s.to_selector=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_to_cls" >> "$TOPOLOGY_MOVES"
+            printf 'move.%s.to_target=%s\n' "$TOPOLOGY_move_index" "$TOPOLOGY_to_tag" >> "$TOPOLOGY_MOVES"
+            printf '%s\t%s\t%s\n' "$TOPOLOGY_ip" "$TOPOLOGY_to_cls" "$TOPOLOGY_to_tag" >> "$TOPOLOGY_MOVE_MAP"
+            router_topology_increment_count "$TOPOLOGY_COUNTS" "counts.after.${TOPOLOGY_to_cls}" || exit 72
+            router_topology_decrement_count "$TOPOLOGY_COUNTS" "counts.after.${TOPOLOGY_from_cls}" || exit 72
+        fi
+    done < "$TOPOLOGY_ROWS"
+    if cmp -s "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_CANONICAL_SELECTOR_FILE"; then
+        TOPOLOGY_result=NORMAL_NOOP
+    else
+        TOPOLOGY_result=NORMAL_SELECTOR_RESTORE
+    fi
 fi
 
 {
@@ -417,16 +452,29 @@ elif [ "$TOPOLOGY_DIRECT_TRANSITION" = EXIT_THRESHOLD_REACHED ]; then
 elif [ "$TOPOLOGY_DIRECT_TRANSITION" = HOLD_BELOW_THRESHOLD ]; then
     TOPOLOGY_DIRECT_ACTION=HOLD
     TOPOLOGY_DIRECT_ACTION_RESULT=NOOP_DIRECT_HELD_BELOW_THRESHOLD
-elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ]; then
-    router_topology_build_selector_candidate "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_MOVE_MAP" "$TOPOLOGY_CANDIDATE" || {
-        router_topology_emit_failed_ack selector_candidate_build_failed candidate false NOT_REQUIRED
-        exit 74
-    }
+elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ] || [ "$TOPOLOGY_result" = NORMAL_SELECTOR_RESTORE ]; then
+    if [ "$TOPOLOGY_result" = NORMAL_SELECTOR_RESTORE ]; then
+        cp "$TOPOLOGY_CANONICAL_SELECTOR_FILE" "$TOPOLOGY_CANDIDATE" || {
+            router_topology_emit_failed_ack canonical_selector_candidate_copy_failed canonical false NOT_REQUIRED
+            exit 74
+        }
+    else
+        router_topology_build_selector_candidate "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_MOVE_MAP" "$TOPOLOGY_CANDIDATE" || {
+            router_topology_emit_failed_ack selector_candidate_build_failed candidate false NOT_REQUIRED
+            exit 74
+        }
+    fi
     router_topology_selector_to_rows "$TOPOLOGY_CANDIDATE" "$TOPOLOGY_CANDIDATE_ROWS" || {
         router_topology_emit_failed_ack selector_candidate_parse_failed candidate false NOT_REQUIRED
         exit 74
     }
     TOPOLOGY_candidate_count="$(awk 'END{print NR+0}' "$TOPOLOGY_CANDIDATE_ROWS")"
+    if [ "$TOPOLOGY_result" = NORMAL_SELECTOR_RESTORE ]; then
+        cmp -s "$TOPOLOGY_CANDIDATE" "$TOPOLOGY_CANONICAL_SELECTOR_FILE" || {
+            router_topology_emit_failed_ack canonical_selector_candidate_mismatch canonical false NOT_REQUIRED
+            exit 74
+        }
+    fi
     [ "$TOPOLOGY_candidate_count" -eq "$TOPOLOGY_peer_count" ] || {
         router_topology_emit_failed_ack selector_candidate_peer_count_mismatch "$TOPOLOGY_candidate_count" false NOT_REQUIRED
         exit 74
