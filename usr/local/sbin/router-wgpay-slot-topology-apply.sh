@@ -31,6 +31,7 @@ TOPOLOGY_ACK_FILE="${ROUTER_TOPOLOGY_ACK_FILE:-${TOPOLOGY_STATE_DIR}/ack.kv}"
 TOPOLOGY_LOCK_FILE="${ROUTER_TOPOLOGY_LOCK_FILE:-${TOPOLOGY_LOCK_FILE:-/var/run/router-wgpay-selector.lock}}"
 TOPOLOGY_DIRECT_MODE_HELPER="${ROUTER_TOPOLOGY_DIRECT_MODE_HELPER:-${TOPOLOGY_DIRECT_MODE_HELPER:-/usr/local/sbin/router-wgpay-direct-mode.sh}}"
 TOPOLOGY_DIRECT_POLICY_ENABLED="${ROUTER_TOPOLOGY_DIRECT_POLICY_ENABLED:-${TOPOLOGY_DIRECT_POLICY_ENABLED:-0}}"
+TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT="${ROUTER_TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT:-${MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT:-}}"
 
 case "${1:---stdin}" in
     --status)
@@ -44,6 +45,11 @@ case "${1:---stdin}" in
     --stdin) ;;
     *) router_topology_reject invalid_mode "${1:-}" 64; exit $? ;;
 esac
+
+case "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT" in
+    ''|*[!0-9]*) router_topology_reject direct_exit_threshold_invalid "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT" 66; exit $? ;;
+esac
+[ "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT" -ge 1 ] && [ "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT" -le 5 ] || { router_topology_reject direct_exit_threshold_out_of_range "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT" 66; exit $?; }
 
 TOPOLOGY_TMP_ROOT="${TMPDIR:-/tmp}/router-wgpay-slot-topology.$$"
 TOPOLOGY_RAW="$TOPOLOGY_TMP_ROOT/input.kv"
@@ -65,6 +71,13 @@ TOPOLOGY_TXN_ACTIVE=false
 TOPOLOGY_TXN_COMMITTED=false
 TOPOLOGY_SELECTOR_CHANGED=false
 TOPOLOGY_DIRECT_CHANGED=false
+TOPOLOGY_DIRECT_ROLLBACK_MODE=''
+TOPOLOGY_DIRECT_ACTIVE_BEFORE=false
+TOPOLOGY_DIRECT_PROBE_RESULT=NOT_REQUESTED
+TOPOLOGY_DIRECT_ACTION=NOT_REQUIRED
+TOPOLOGY_DIRECT_ACTION_RESULT=NOT_REQUESTED
+TOPOLOGY_DIRECT_TRANSITION=NOT_REQUIRED
+TOPOLOGY_SUPPRESS_SELECTOR_TRANSACTION=false
 TOPOLOGY_OLD_STATE_EXISTED=false
 TOPOLOGY_OLD_PLAN_EXISTED=false
 TOPOLOGY_OLD_ACK_EXISTED=false
@@ -83,8 +96,8 @@ router_topology_transaction_rollback() {
             router_topology_verify_selector_runtime "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_SELECTOR_TABLE" "${TOPOLOGY_peer_count:-0}" '' "$TOPOLOGY_TMP_ROOT/rollback-verify" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
         fi
     fi
-    if [ "$TOPOLOGY_DIRECT_CHANGED" = true ] && [ -x "$TOPOLOGY_DIRECT_MODE_HELPER" ]; then
-        ROUTER_WGPAY_DIRECT_CONFIG="$TOPOLOGY_CONFIG" "$TOPOLOGY_DIRECT_MODE_HELPER" --disable topology_transaction_rollback "$TOPOLOGY_msg_source_generation" "$TOPOLOGY_msg_generation" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
+    if [ "$TOPOLOGY_DIRECT_CHANGED" = true ] && [ -n "$TOPOLOGY_DIRECT_ROLLBACK_MODE" ] && [ -x "$TOPOLOGY_DIRECT_MODE_HELPER" ]; then
+        ROUTER_WGPAY_DIRECT_CONFIG="$TOPOLOGY_CONFIG" "$TOPOLOGY_DIRECT_MODE_HELPER" "$TOPOLOGY_DIRECT_ROLLBACK_MODE" topology_transaction_rollback "$TOPOLOGY_msg_source_generation" "$TOPOLOGY_msg_generation" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
     fi
     router_topology_restore_file_state "$TOPOLOGY_OLD_STATE_EXISTED" "$TOPOLOGY_TXN_DIR/state.before" "$TOPOLOGY_STATE_FILE" 600 || router_topology_rb_rc=1
     router_topology_restore_file_state "$TOPOLOGY_OLD_PLAN_EXISTED" "$TOPOLOGY_TXN_DIR/plan.before" "$TOPOLOGY_PLAN_FILE" 600 || router_topology_rb_rc=1
@@ -167,6 +180,12 @@ router_topology_csv_validate_subsequence "$TOPOLOGY_msg_exhausted_selectors" "$T
 router_topology_sets_complete_disjoint "$TOPOLOGY_msg_healthy_slots" "$TOPOLOGY_msg_exhausted_slots" "$TOPOLOGY_CANONICAL_SLOTS" || { router_topology_reject slot_sets_not_complete_disjoint sets 66; exit $?; }
 router_topology_sets_complete_disjoint "$TOPOLOGY_msg_healthy_selectors" "$TOPOLOGY_msg_exhausted_selectors" "$TOPOLOGY_CANONICAL_SELECTORS" || { router_topology_reject selector_sets_not_complete_disjoint sets 66; exit $?; }
 router_topology_validate_slot_selector_alignment "$TOPOLOGY_msg_healthy_slots" "$TOPOLOGY_msg_exhausted_slots" "$TOPOLOGY_msg_healthy_selectors" "$TOPOLOGY_msg_exhausted_selectors" || { router_topology_reject slot_selector_mapping_invalid sets 66; exit $?; }
+if [ -n "$TOPOLOGY_msg_healthy_slots" ]; then
+    TOPOLOGY_healthy_slot_count="$(printf '%s
+' "$TOPOLOGY_msg_healthy_slots" | awk -F, '{print NF}')"
+else
+    TOPOLOGY_healthy_slot_count=0
+fi
 if [ "$TOPOLOGY_msg_mode" = NORMAL ]; then
     [ "$TOPOLOGY_msg_healthy_slots" = "$TOPOLOGY_CANONICAL_SLOTS" ] && [ -z "$TOPOLOGY_msg_exhausted_slots" ] && [ "$TOPOLOGY_msg_healthy_selectors" = "$TOPOLOGY_CANONICAL_SELECTORS" ] && [ -z "$TOPOLOGY_msg_exhausted_selectors" ] || { router_topology_reject normal_sets_invalid sets 66; exit $?; }
 else
@@ -220,6 +239,30 @@ TOPOLOGY_selector_parse_rc=$?
 [ "$TOPOLOGY_selector_parse_rc" -eq 0 ] || { router_topology_reject selector_parse_failed "$TOPOLOGY_selector_parse_rc" 71; exit $?; }
 TOPOLOGY_peer_count="$(awk 'END{print NR+0}' "$TOPOLOGY_ROWS")"
 TOPOLOGY_selector_sha="$(sha256sum "$TOPOLOGY_SELECTOR_FILE" | awk '{print $1}')"
+if [ "$TOPOLOGY_healthy_slot_count" -gt 0 ]; then
+    [ -x "$TOPOLOGY_DIRECT_MODE_HELPER" ] || { router_topology_reject direct_helper_missing "$TOPOLOGY_DIRECT_MODE_HELPER" 73; exit $?; }
+    TOPOLOGY_DIRECT_PROBE_LOG="$TOPOLOGY_TMP_ROOT/direct-probe.log"
+    ROUTER_WGPAY_DIRECT_CONFIG="$TOPOLOGY_CONFIG" "$TOPOLOGY_DIRECT_MODE_HELPER" --probe topology_probe "$TOPOLOGY_msg_source_generation" "$TOPOLOGY_msg_generation" > "$TOPOLOGY_DIRECT_PROBE_LOG" 2>&1
+    TOPOLOGY_direct_probe_rc=$?
+    if [ "$TOPOLOGY_direct_probe_rc" -ne 0 ]; then
+        router_topology_reject direct_probe_failed "$TOPOLOGY_direct_probe_rc" 73
+        cat "$TOPOLOGY_DIRECT_PROBE_LOG" >&2
+        exit 73
+    fi
+    TOPOLOGY_DIRECT_PROBE_RESULT="$(awk -F= '$1=="RESULT"{print substr($0,index($0,"=")+1)}' "$TOPOLOGY_DIRECT_PROBE_LOG" | tail -n1)"
+    TOPOLOGY_direct_probe_active="$(awk -F= '$1=="DIRECT_MODE_ACTIVE"{print substr($0,index($0,"=")+1)}' "$TOPOLOGY_DIRECT_PROBE_LOG" | tail -n1)"
+    [ "$TOPOLOGY_DIRECT_PROBE_RESULT" = PASS_DIRECT_MODE_PROBE ] || { router_topology_reject direct_probe_result_invalid "$TOPOLOGY_DIRECT_PROBE_RESULT" 73; exit $?; }
+    case "$TOPOLOGY_direct_probe_active" in true|false) ;; *) router_topology_reject direct_probe_active_invalid "$TOPOLOGY_direct_probe_active" 73; exit $?;; esac
+    TOPOLOGY_DIRECT_ACTIVE_BEFORE="$TOPOLOGY_direct_probe_active"
+    if [ "$TOPOLOGY_DIRECT_ACTIVE_BEFORE" = true ]; then
+        TOPOLOGY_SUPPRESS_SELECTOR_TRANSACTION=true
+        if [ "$TOPOLOGY_healthy_slot_count" -ge "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT" ]; then
+            TOPOLOGY_DIRECT_TRANSITION=EXIT_THRESHOLD_REACHED
+        else
+            TOPOLOGY_DIRECT_TRANSITION=HOLD_BELOW_THRESHOLD
+        fi
+    fi
+fi
 : > "$TOPOLOGY_COUNTS"
 for TOPOLOGY_cls in cs1 cs2 cs3 cs4 cs5; do
     TOPOLOGY_cls_count="$(router_topology_count_class "$TOPOLOGY_ROWS" "$TOPOLOGY_cls")"
@@ -237,6 +280,13 @@ if [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ] && [ -z "$TOPOLOGY_msg_healthy_sele
         function has(csv,item, a,n,i){n=split(csv,a,",");for(i=1;i<=n;i++)if(a[i]==item)return 1;return 0}
         has(exhausted,$3){n++} END{print n+0}
     ' "$TOPOLOGY_ROWS")"
+elif [ "$TOPOLOGY_SUPPRESS_SELECTOR_TRANSACTION" = true ]; then
+    case "$TOPOLOGY_DIRECT_TRANSITION" in
+        EXIT_THRESHOLD_REACHED) TOPOLOGY_result=DIRECT_EXIT ;;
+        HOLD_BELOW_THRESHOLD) TOPOLOGY_result=DIRECT_HOLD ;;
+        *) router_topology_reject direct_transition_invalid "$TOPOLOGY_DIRECT_TRANSITION" 73; exit $? ;;
+    esac
+    TOPOLOGY_remaining="$(router_topology_count_exhausted_rows "$TOPOLOGY_ROWS" "$TOPOLOGY_msg_exhausted_selectors")"
 elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ]; then
     while IFS="$(printf '\t')" read -r TOPOLOGY_sortkey TOPOLOGY_ip TOPOLOGY_from_cls TOPOLOGY_from_tag; do
         router_topology_csv_contains "$TOPOLOGY_msg_exhausted_selectors" "$TOPOLOGY_from_cls" || continue
@@ -316,6 +366,7 @@ TOPOLOGY_exhausted_remaining="$TOPOLOGY_remaining"
 TOPOLOGY_final_result=PASS
 
 if [ "$TOPOLOGY_result" = DIRECT_REQUIRED ]; then
+    TOPOLOGY_DIRECT_ACTION=ENTER
     [ -x "$TOPOLOGY_DIRECT_MODE_HELPER" ] || {
         router_topology_emit_failed_ack direct_helper_missing "$TOPOLOGY_DIRECT_MODE_HELPER" false NOT_REQUIRED
         exit 73
@@ -335,8 +386,37 @@ if [ "$TOPOLOGY_result" = DIRECT_REQUIRED ]; then
         exit 73
         ;;
     esac
-    [ "$TOPOLOGY_direct_changed" = true ] && TOPOLOGY_DIRECT_CHANGED=true
+    TOPOLOGY_DIRECT_ACTION_RESULT="$TOPOLOGY_direct_result"
+    if [ "$TOPOLOGY_direct_changed" = true ]; then
+        TOPOLOGY_DIRECT_CHANGED=true
+        TOPOLOGY_DIRECT_ROLLBACK_MODE=--disable
+    fi
     TOPOLOGY_final_result=DIRECT_REQUIRED
+elif [ "$TOPOLOGY_DIRECT_TRANSITION" = EXIT_THRESHOLD_REACHED ]; then
+    TOPOLOGY_DIRECT_ACTION=EXIT
+    TOPOLOGY_DIRECT_LOG="$TOPOLOGY_TMP_ROOT/direct-mode.log"
+    ROUTER_WGPAY_DIRECT_CONFIG="$TOPOLOGY_CONFIG" "$TOPOLOGY_DIRECT_MODE_HELPER" --disable DIRECT_EXIT_THRESHOLD "$TOPOLOGY_msg_source_generation" "$TOPOLOGY_msg_generation" > "$TOPOLOGY_DIRECT_LOG" 2>&1
+    TOPOLOGY_direct_rc=$?
+    if [ "$TOPOLOGY_direct_rc" -ne 0 ]; then
+        router_topology_emit_failed_ack direct_disable_failed "$TOPOLOGY_direct_rc" false NOT_REQUIRED
+        cat "$TOPOLOGY_DIRECT_LOG" >&2
+        exit 73
+    fi
+    TOPOLOGY_direct_result="$(awk -F= '$1=="RESULT"{print substr($0,index($0,"=")+1)}' "$TOPOLOGY_DIRECT_LOG" | tail -n1)"
+    TOPOLOGY_direct_changed="$(awk -F= '$1=="DIRECT_MODE_CHANGED"{print substr($0,index($0,"=")+1)}' "$TOPOLOGY_DIRECT_LOG" | tail -n1)"
+    case "$TOPOLOGY_direct_result" in NOOP_DIRECT_ALREADY_DISABLED|PASS_DIRECT_MODE_DISABLED) ;; *)
+        router_topology_emit_failed_ack direct_disable_result_invalid "$TOPOLOGY_direct_result" false NOT_REQUIRED
+        exit 73
+        ;;
+    esac
+    TOPOLOGY_DIRECT_ACTION_RESULT="$TOPOLOGY_direct_result"
+    if [ "$TOPOLOGY_direct_changed" = true ]; then
+        TOPOLOGY_DIRECT_CHANGED=true
+        TOPOLOGY_DIRECT_ROLLBACK_MODE=--enable
+    fi
+elif [ "$TOPOLOGY_DIRECT_TRANSITION" = HOLD_BELOW_THRESHOLD ]; then
+    TOPOLOGY_DIRECT_ACTION=HOLD
+    TOPOLOGY_DIRECT_ACTION_RESULT=NOOP_DIRECT_HELD_BELOW_THRESHOLD
 elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ]; then
     router_topology_build_selector_candidate "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_MOVE_MAP" "$TOPOLOGY_CANDIDATE" || {
         router_topology_emit_failed_ack selector_candidate_build_failed candidate false NOT_REQUIRED
@@ -416,7 +496,15 @@ fi
     printf 'received_epoch=%s\n' "$TOPOLOGY_NOW_EPOCH"
     printf 'apply_result=%s\n' "$TOPOLOGY_final_result"
     printf 'direct_policy_enabled=%s\n' "$TOPOLOGY_DIRECT_POLICY_ENABLED"
-    printf 'direct_request_result=%s\n' "${TOPOLOGY_direct_result:-NOT_REQUESTED}"
+    printf 'healthy_slot_count=%s\n' "$TOPOLOGY_healthy_slot_count"
+    printf 'min_healthy_slots_to_exit_direct=%s\n' "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT"
+    printf 'direct_active_before=%s\n' "$TOPOLOGY_DIRECT_ACTIVE_BEFORE"
+    printf 'direct_probe_result=%s\n' "$TOPOLOGY_DIRECT_PROBE_RESULT"
+    printf 'direct_transition=%s\n' "$TOPOLOGY_DIRECT_TRANSITION"
+    printf 'direct_action=%s\n' "$TOPOLOGY_DIRECT_ACTION"
+    printf 'direct_action_result=%s\n' "$TOPOLOGY_DIRECT_ACTION_RESULT"
+    printf 'direct_request_result=%s\n' "$TOPOLOGY_DIRECT_ACTION_RESULT"
+    printf 'selector_transaction_suppressed=%s\n' "$TOPOLOGY_SUPPRESS_SELECTOR_TRANSACTION"
     printf 'apply_performed=%s\n' "$TOPOLOGY_apply_performed"
     printf 'selector_sha256_before=%s\n' "$TOPOLOGY_selector_sha"
     printf 'selector_sha256=%s\n' "$TOPOLOGY_selector_sha_after"
@@ -433,7 +521,15 @@ fi
     printf 'schema=%s\n' "$TOPOLOGY_ACK_SCHEMA"
     printf 'result=%s\n' "$TOPOLOGY_final_result"
     printf 'direct_policy_enabled=%s\n' "$TOPOLOGY_DIRECT_POLICY_ENABLED"
-    printf 'direct_request_result=%s\n' "${TOPOLOGY_direct_result:-NOT_REQUESTED}"
+    printf 'healthy_slot_count=%s\n' "$TOPOLOGY_healthy_slot_count"
+    printf 'min_healthy_slots_to_exit_direct=%s\n' "$TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT"
+    printf 'direct_active_before=%s\n' "$TOPOLOGY_DIRECT_ACTIVE_BEFORE"
+    printf 'direct_probe_result=%s\n' "$TOPOLOGY_DIRECT_PROBE_RESULT"
+    printf 'direct_transition=%s\n' "$TOPOLOGY_DIRECT_TRANSITION"
+    printf 'direct_action=%s\n' "$TOPOLOGY_DIRECT_ACTION"
+    printf 'direct_action_result=%s\n' "$TOPOLOGY_DIRECT_ACTION_RESULT"
+    printf 'direct_request_result=%s\n' "$TOPOLOGY_DIRECT_ACTION_RESULT"
+    printf 'selector_transaction_suppressed=%s\n' "$TOPOLOGY_SUPPRESS_SELECTOR_TRANSACTION"
     printf 'accepted_generation=%s\n' "$TOPOLOGY_msg_generation"
     printf 'applied_generation=%s\n' "$TOPOLOGY_msg_generation"
     printf 'apply_performed=%s\n' "$TOPOLOGY_apply_performed"
@@ -451,7 +547,11 @@ fi
     done
 } > "$TOPOLOGY_ACK_TMP"
 
-router_topology_atomic_write "$TOPOLOGY_PLAN_TMP" "$TOPOLOGY_PLAN_FILE" 600 || TOPOLOGY_persist_rc=1
+if [ "${ROUTER_TOPOLOGY_TEST_FAULT:-}" = topology_persist ]; then
+    TOPOLOGY_persist_rc=1
+else
+    router_topology_atomic_write "$TOPOLOGY_PLAN_TMP" "$TOPOLOGY_PLAN_FILE" 600 || TOPOLOGY_persist_rc=1
+fi
 : "${TOPOLOGY_persist_rc:=0}"
 [ "$TOPOLOGY_persist_rc" -ne 0 ] || router_topology_atomic_write "$TOPOLOGY_STATE_TMP" "$TOPOLOGY_STATE_FILE" 600 || TOPOLOGY_persist_rc=1
 [ "$TOPOLOGY_persist_rc" -ne 0 ] || router_topology_atomic_write "$TOPOLOGY_ACK_TMP" "$TOPOLOGY_ACK_FILE" 600 || TOPOLOGY_persist_rc=1

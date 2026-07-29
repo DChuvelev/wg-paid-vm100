@@ -18,12 +18,13 @@ VPN_SET="${ROUTER_WGPAY_DIRECT_VPN_SOURCE_SET:-${TOPOLOGY_DIRECT_VPN_SOURCE_SET:
 PAID_CIDR="${ROUTER_WGPAY_DIRECT_PAID_SOURCE_CIDR:-${TOPOLOGY_DIRECT_PAID_SOURCE_CIDR:-10.253.0.0/16}}"
 NOW="${ROUTER_WGPAY_DIRECT_NOW_EPOCH:-$(date +%s)}"
 SCHEMA=router-wgpay-direct-mode-state-v1
+TEST_FAULT="${ROUTER_WGPAY_DIRECT_TEST_FAULT:-}"
 
 mode="${1:---status}"
 reason="${2:-manual}"
 source_generation="${3:-unknown}"
 topology_generation="${4:-unknown}"
-case "$mode" in --request|--enable|--disable|--status) ;; *) echo 'Usage: router-wgpay-direct-mode.sh --request DIRECT_REQUIRED [source_generation] [topology_generation] | --enable [reason] | --disable [reason] | --status' >&2; exit 64;; esac
+case "$mode" in --request|--enable|--disable|--probe|--status) ;; *) echo 'Usage: router-wgpay-direct-mode.sh --request DIRECT_REQUIRED [source_generation] [topology_generation] | --enable [reason] | --disable [reason] | --probe | --status' >&2; exit 64;; esac
 
 if [ "$mode" = --status ]; then
     if [ -f "$STATE_FILE" ]; then cat "$STATE_FILE"; else echo schema="$SCHEMA"; echo initialized=false; echo policy_enabled="$POLICY_ENABLED"; fi
@@ -51,6 +52,7 @@ set_dump() { "$NFT_BIN" list set "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" 2>/dev/nu
 set_contains_paid() { set_dump | grep -Fq "$PAID_CIDR"; }
 write_state() {
     active="$1"; state_mode="$2"; result="$3"
+    [ "$TEST_FAULT" != state_write ] || return 1
     tmp="$STATE_DIR/state.$$"
     {
         echo schema="$SCHEMA"
@@ -70,6 +72,14 @@ write_state() {
 
 set_dump >/dev/null 2>&1 || { echo RESULT=STOP_DIRECT_VPN_SOURCE_SET_MISSING; echo VPN_SOURCE_SET="$VPN_SET"; exit 70; }
 
+if [ "$mode" = --probe ]; then
+    if set_contains_paid; then probe_active=false; else probe_active=true; fi
+    echo RESULT=PASS_DIRECT_MODE_PROBE
+    echo DIRECT_MODE_ACTIVE="$probe_active"
+    echo DIRECT_MODE_CHANGED=false
+    exit 0
+fi
+
 if [ "$mode" = --enable ]; then
     if ! set_contains_paid; then
         write_state true DIRECT NOOP_ALREADY_DIRECT || exit 70
@@ -80,7 +90,12 @@ if [ "$mode" = --enable ]; then
     fi
     printf 'delete element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - || { echo RESULT=STOP_DIRECT_NFT_ENABLE_FAILED; exit 71; }
     ! set_contains_paid || { echo RESULT=STOP_DIRECT_NFT_ENABLE_VERIFY; exit 72; }
-    write_state true DIRECT PASS_DIRECT_ENABLED || exit 70
+    if ! write_state true DIRECT PASS_DIRECT_ENABLED; then
+        printf 'add element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - >/dev/null 2>&1 || true
+        set_contains_paid || { echo RESULT=STOP_DIRECT_ENABLE_STATE_ROLLBACK_FAILED; exit 74; }
+        echo RESULT=STOP_DIRECT_STATE_WRITE_FAILED
+        exit 73
+    fi
     echo RESULT=PASS_DIRECT_MODE_ENABLED
     echo DIRECT_MODE_ACTIVE=true
     echo DIRECT_MODE_CHANGED=true
@@ -96,7 +111,12 @@ if set_contains_paid; then
 fi
 printf 'add element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - || { echo RESULT=STOP_DIRECT_NFT_DISABLE_FAILED; exit 71; }
 set_contains_paid || { echo RESULT=STOP_DIRECT_NFT_DISABLE_VERIFY; exit 72; }
-write_state false NORMAL PASS_DIRECT_DISABLED || exit 70
+if ! write_state false NORMAL PASS_DIRECT_DISABLED; then
+    printf 'delete element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - >/dev/null 2>&1 || true
+    ! set_contains_paid || { echo RESULT=STOP_DIRECT_DISABLE_STATE_ROLLBACK_FAILED; exit 74; }
+    echo RESULT=STOP_DIRECT_STATE_WRITE_FAILED
+    exit 73
+fi
 echo RESULT=PASS_DIRECT_MODE_DISABLED
 echo DIRECT_MODE_ACTIVE=false
 echo DIRECT_MODE_CHANGED=true
