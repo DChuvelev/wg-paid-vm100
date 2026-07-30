@@ -459,10 +459,12 @@ elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ] || [ "$TOPOLOGY_result" = NORMAL_
             exit 74
         }
     else
-        router_topology_build_selector_candidate "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_MOVE_MAP" "$TOPOLOGY_CANDIDATE" || {
-            router_topology_emit_failed_ack selector_candidate_build_failed candidate false NOT_REQUIRED
+        router_topology_build_selector_candidate "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_MOVE_MAP" "$TOPOLOGY_CANDIDATE"
+        TOPOLOGY_candidate_build_rc=$?
+        if [ "$TOPOLOGY_candidate_build_rc" -ne 0 ]; then
+            router_topology_emit_failed_ack selector_candidate_build_failed "rc${TOPOLOGY_candidate_build_rc}" false NOT_REQUIRED
             exit 74
-        }
+        fi
     fi
     router_topology_selector_to_rows "$TOPOLOGY_CANDIDATE" "$TOPOLOGY_CANDIDATE_ROWS" || {
         router_topology_emit_failed_ack selector_candidate_parse_failed candidate false NOT_REQUIRED

@@ -233,6 +233,17 @@ router_topology_build_selector_candidate() {
     router_topology_candidate_selector="$1"
     router_topology_candidate_moves="$2"
     router_topology_candidate_output="$3"
+
+    # POSIX awk NR==FNR is ambiguous when the first input file is empty:
+    # the first selector row is then treated as a move-map row and END exits 52.
+    # An empty move map is a valid idempotent topology transition, so copy the
+    # selector byte-for-byte and let the caller's exhausted-row verification
+    # decide whether the no-op candidate is semantically acceptable.
+    if [ ! -s "$router_topology_candidate_moves" ]; then
+        cp "$router_topology_candidate_selector" "$router_topology_candidate_output"
+        return $?
+    fi
+
     awk -F '\t' '
         NR==FNR {
             if (NF != 3 || seen[$1]++) exit 51;
