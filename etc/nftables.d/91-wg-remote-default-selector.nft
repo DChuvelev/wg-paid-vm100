@@ -1,0 +1,5 @@
+chain wg_remote_default_selector {
+    type filter hook prerouting priority mangle; policy accept;
+
+    iifname "wg_remote" ip dscp set cs4 counter comment "WG_REMOTE_DEFAULT_SELECTOR_CS4"
+}
