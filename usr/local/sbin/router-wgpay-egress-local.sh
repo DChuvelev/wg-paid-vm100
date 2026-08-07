@@ -2,8 +2,12 @@
 set -u
 
 MODE="${1:---dry-run}"
-SEL="${ROUTER_EGRESS_SELECTOR_FILE:-/etc/router-wgpay-selector.d/peers.conf}"
-APPLY="${ROUTER_EGRESS_SELECTOR_APPLY:-/usr/local/sbin/router-wgpay-canary-apply.sh}"
+LIFECYCLE_CONFIG="${ROUTER_WGPAY_PEER_CONFIG:-/etc/router-wgpay-peer-lifecycle.conf}"
+[ -r "$LIFECYCLE_CONFIG" ] && . "$LIFECYCLE_CONFIG"
+SEL="${ROUTER_EGRESS_SELECTOR_FILE:-${PEER_ACTIVE_SELECTOR_FILE:-/etc/router-wgpay-selector.d/peers.conf}}"
+APPLY="${ROUTER_EGRESS_SELECTOR_APPLY:-${PEER_SELECTOR_APPLY:-/usr/local/sbin/router-wgpay-canary-apply.sh}}"
+REGISTRY_FILE="${ROUTER_EGRESS_REGISTRY_FILE:-${PEER_REGISTRY_FILE:-/etc/router-wgpay-peer-state/registry.tsv}}"
+REGISTRY_SYNC="${ROUTER_EGRESS_REGISTRY_SYNC:-/usr/local/sbin/router-wgpay-peer-lifecycle.sh}"
 STATE_DIR="${ROUTER_EGRESS_STATE_DIR:-/var/lib/router-wgpay-egress}"
 STATE_FILE="${ROUTER_EGRESS_STATE_FILE:-${STATE_DIR}/state.kv}"
 SELECTOR_LOCK="${ROUTER_EGRESS_SELECTOR_LOCK:-/var/run/router-wgpay-selector.lock}"
@@ -174,7 +178,8 @@ TMP="/tmp/router-wgpay-egress-local-rows.$$"
 STATE_TMP="/tmp/router-wgpay-egress-local-state.$$"
 SEL_TMP="/tmp/router-wgpay-egress-local-selector.$$"
 APPLY_LOG="/tmp/router-wgpay-egress-local-apply.$$.log"
-trap 'rm -f "$TMP" "$STATE_TMP" "$SEL_TMP" "$APPLY_LOG" "${STATE_FILE}.tmp.$$"' EXIT
+REGISTRY_SYNC_LOG="/tmp/router-wgpay-egress-local-registry-sync.$$.log"
+trap 'rm -f "$TMP" "$STATE_TMP" "$SEL_TMP" "$SEL_TMP.before" "$APPLY_LOG" "$REGISTRY_SYNC_LOG" "${STATE_FILE}.tmp.$$"' EXIT
 : > "$TMP"
 
 grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest; do
@@ -433,6 +438,10 @@ if [ "$MODE" = --commit ] && [ "$fatal_topology_state" != true ]; then
     selector_update_rc=$?
 
     if [ "$selector_update_rc" = 0 ]; then
+      cp "$SEL" "$SEL_TMP.before" || selector_update_rc=$?
+    fi
+
+    if [ "$selector_update_rc" = 0 ]; then
       selector_new_sha="$(sha256sum "$SEL_TMP" | awk '{print $1}')"
       mv "$SEL_TMP" "$SEL"
       selector_update_rc=$?
@@ -443,6 +452,15 @@ if [ "$MODE" = --commit ] && [ "$fatal_topology_state" != true ]; then
       "$APPLY" start > "$APPLY_LOG" 2>&1
       selector_apply_rc=$?
       selector_apply_performed=true
+      if [ "$selector_apply_rc" = 0 ] && [ -s "$REGISTRY_FILE" ] && [ -x "$REGISTRY_SYNC" ]; then
+        "$REGISTRY_SYNC" --sync-from-selectors-unlocked > "$REGISTRY_SYNC_LOG" 2>&1
+        registry_sync_rc=$?
+        if [ "$registry_sync_rc" -ne 0 ]; then
+          cp "$SEL_TMP.before" "$SEL" >/dev/null 2>&1 || true
+          "$APPLY" start >> "$APPLY_LOG" 2>&1 || true
+          selector_apply_rc=71
+        fi
+      fi
     else
       [ -x "$APPLY" ] || selector_apply_rc=apply_script_missing
     fi

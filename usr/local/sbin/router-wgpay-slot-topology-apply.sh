@@ -34,6 +34,8 @@ TOPOLOGY_LOCK_FILE="${ROUTER_TOPOLOGY_LOCK_FILE:-${TOPOLOGY_LOCK_FILE:-/var/run/
 TOPOLOGY_DIRECT_MODE_HELPER="${ROUTER_TOPOLOGY_DIRECT_MODE_HELPER:-${TOPOLOGY_DIRECT_MODE_HELPER:-/usr/local/sbin/router-wgpay-direct-mode.sh}}"
 TOPOLOGY_DIRECT_POLICY_ENABLED="${ROUTER_TOPOLOGY_DIRECT_POLICY_ENABLED:-${TOPOLOGY_DIRECT_POLICY_ENABLED:-0}}"
 TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT="${ROUTER_TOPOLOGY_MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT:-${MIN_HEALTHY_SLOTS_TO_EXIT_DIRECT:-}}"
+TOPOLOGY_PEER_REGISTRY_FILE="${ROUTER_TOPOLOGY_PEER_REGISTRY_FILE:-${TOPOLOGY_PEER_REGISTRY_FILE:-/etc/router-wgpay-peer-state/registry.tsv}}"
+TOPOLOGY_PEER_REGISTRY_SYNC="${ROUTER_TOPOLOGY_PEER_REGISTRY_SYNC:-${TOPOLOGY_PEER_REGISTRY_SYNC:-/usr/local/sbin/router-wgpay-peer-lifecycle.sh}}"
 
 case "${1:---stdin}" in
     --status)
@@ -68,6 +70,7 @@ TOPOLOGY_CANDIDATE="$TOPOLOGY_TMP_ROOT/selector.candidate"
 TOPOLOGY_CANDIDATE_ROWS="$TOPOLOGY_TMP_ROOT/selector-candidate-rows.tsv"
 TOPOLOGY_APPLY_LOG="$TOPOLOGY_TMP_ROOT/selector-apply.log"
 TOPOLOGY_ROLLBACK_LOG="$TOPOLOGY_TMP_ROOT/rollback.log"
+TOPOLOGY_REGISTRY_SYNC_LOG="$TOPOLOGY_TMP_ROOT/registry-sync.log"
 TOPOLOGY_TXN_DIR="$TOPOLOGY_TMP_ROOT/transaction"
 TOPOLOGY_PLAN_TMP="$TOPOLOGY_TMP_ROOT/plan.kv"
 TOPOLOGY_STATE_TMP="$TOPOLOGY_TMP_ROOT/state.kv"
@@ -86,6 +89,7 @@ TOPOLOGY_SUPPRESS_SELECTOR_TRANSACTION=false
 TOPOLOGY_OLD_STATE_EXISTED=false
 TOPOLOGY_OLD_PLAN_EXISTED=false
 TOPOLOGY_OLD_ACK_EXISTED=false
+TOPOLOGY_REGISTRY_BACKUP_EXISTED=false
 
 router_topology_transaction_rollback() {
     router_topology_rb_rc=0
@@ -100,6 +104,9 @@ router_topology_transaction_rollback() {
         if [ "$router_topology_rb_rc" -eq 0 ]; then
             router_topology_verify_selector_runtime "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_SELECTOR_TABLE" "${TOPOLOGY_peer_count:-0}" '' "$TOPOLOGY_TMP_ROOT/rollback-verify" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
         fi
+    fi
+    if [ "$TOPOLOGY_REGISTRY_BACKUP_EXISTED" = true ] && [ -f "$TOPOLOGY_TXN_DIR/registry.before" ]; then
+        router_topology_atomic_write "$TOPOLOGY_TXN_DIR/registry.before" "$TOPOLOGY_PEER_REGISTRY_FILE" 600 || router_topology_rb_rc=1
     fi
     if [ "$TOPOLOGY_DIRECT_CHANGED" = true ] && [ -n "$TOPOLOGY_DIRECT_ROLLBACK_MODE" ] && [ -x "$TOPOLOGY_DIRECT_MODE_HELPER" ]; then
         ROUTER_WGPAY_DIRECT_CONFIG="$TOPOLOGY_CONFIG" "$TOPOLOGY_DIRECT_MODE_HELPER" "$TOPOLOGY_DIRECT_ROLLBACK_MODE" topology_transaction_rollback "$TOPOLOGY_msg_source_generation" "$TOPOLOGY_msg_generation" >> "$TOPOLOGY_ROLLBACK_LOG" 2>&1 || router_topology_rb_rc=1
@@ -488,6 +495,14 @@ elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ] || [ "$TOPOLOGY_result" = NORMAL_
     }
     TOPOLOGY_selector_sha_after="$(sha256sum "$TOPOLOGY_CANDIDATE" | awk '{print $1}')"
 
+    if [ -s "$TOPOLOGY_PEER_REGISTRY_FILE" ]; then
+        cp "$TOPOLOGY_PEER_REGISTRY_FILE" "$TOPOLOGY_TXN_DIR/registry.before" || {
+            router_topology_emit_failed_ack peer_registry_backup_failed registry false NOT_REQUIRED
+            exit 76
+        }
+        TOPOLOGY_REGISTRY_BACKUP_EXISTED=true
+    fi
+
     cp "$TOPOLOGY_SELECTOR_FILE" "$TOPOLOGY_TXN_DIR/selector.before" || {
         router_topology_emit_failed_ack selector_backup_failed selector false NOT_REQUIRED
         exit 76
@@ -528,6 +543,15 @@ elif [ "$TOPOLOGY_msg_mode" = SLOT_EXHAUSTED ] || [ "$TOPOLOGY_result" = NORMAL_
         if router_topology_transaction_rollback; then TOPOLOGY_rb=PASS; else TOPOLOGY_rb=FAILED; fi
         router_topology_emit_failed_ack selector_verify_failed "$TOPOLOGY_verify_rc" true "$TOPOLOGY_rb"
         [ "$TOPOLOGY_rb" = PASS ] && exit 80 || exit 81
+    fi
+    if [ -s "$TOPOLOGY_PEER_REGISTRY_FILE" ] && [ -x "$TOPOLOGY_PEER_REGISTRY_SYNC" ]; then
+        "$TOPOLOGY_PEER_REGISTRY_SYNC" --sync-from-selectors-unlocked > "$TOPOLOGY_REGISTRY_SYNC_LOG" 2>&1
+        TOPOLOGY_registry_sync_rc=$?
+        if [ "$TOPOLOGY_registry_sync_rc" -ne 0 ]; then
+            if router_topology_transaction_rollback; then TOPOLOGY_rb=PASS; else TOPOLOGY_rb=FAILED; fi
+            router_topology_emit_failed_ack peer_registry_sync_failed "$TOPOLOGY_registry_sync_rc" true "$TOPOLOGY_rb"
+            [ "$TOPOLOGY_rb" = PASS ] && exit 84 || exit 85
+        fi
     fi
 fi
 
