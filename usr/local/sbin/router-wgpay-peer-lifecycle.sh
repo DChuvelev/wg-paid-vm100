@@ -118,6 +118,32 @@ case "$MODE" in
     echo profile_count="$(peer_registry_count "$PEER_REGISTRY_FILE")"
     ;;
 
+  --ensure)
+    request="${2:-}" psk_file="${3:-}"
+    [ -r "$request" ] && [ -r "$psk_file" ] || { peer_stop ensure_input_missing 64; exit $?; }
+    operation_id="$(peer_request_get operation_id "$request")"; profile_id="$(peer_request_get profile_id "$request")"; protocol="$(peer_request_get protocol "$request")"; public_key="$(peer_request_get public_key "$request")"; tunnel_ip="$(peer_request_get tunnel_ip "$request")"; desired_generation="$(peer_request_get desired_generation "$request")"
+    peer_valid_id "$operation_id" && peer_valid_id "$profile_id" && peer_valid_key "$public_key" && peer_valid_generation "$desired_generation" || { peer_stop ensure_input_invalid 64; exit $?; }
+    peer_protocol_resolve "$protocol" || { peer_stop protocol_disabled_or_invalid 64; exit $?; }
+    peer_ip_in_pool "$tunnel_ip" "$PEER_PROTOCOL_POOL" || { peer_stop tunnel_ip_outside_pool 64; exit $?; }
+    lock
+    [ -s "$PEER_REGISTRY_FILE" ] || { peer_stop registry_not_initialized 71; exit $?; }
+    refresh_internal || { peer_stop selector_refresh_failed 72; exit $?; }
+    existing="$(awk -F '\t' -v id="$profile_id" '$0!~/^#/ && $1==id{print;exit}' "$PEER_REGISTRY_FILE")"
+    [ -n "$existing" ] || { peer_stop profile_not_registered 66; exit $?; }
+    old="$(printf '%s\n' "$existing" | awk -F '\t' '{print $2"|"$3"|"$4"|"$5}')"
+    [ "$old" = "$protocol|$PEER_PROTOCOL_INTERFACE|$public_key|$tunnel_ip" ] || { peer_stop profile_id_conflict 66; exit $?; }
+    conflict_key="$(peer_runtime_key_for_ip "$PEER_PROTOCOL_CLI" "$PEER_PROTOCOL_INTERFACE" "$tunnel_ip")"
+    [ -z "$conflict_key" ] || [ "$conflict_key" = "$public_key" ] || { peer_stop runtime_tunnel_ip_conflict 66; exit $?; }
+    "$PEER_PROTOCOL_CLI" set "$PEER_PROTOCOL_INTERFACE" peer "$public_key" preshared-key "$psk_file" allowed-ips "$tunnel_ip/32" || { peer_stop runtime_peer_ensure_failed 73; exit $?; }
+    actual="$(peer_runtime_ip_for_key "$PEER_PROTOCOL_CLI" "$PEER_PROTOCOL_INTERFACE" "$public_key")"
+    [ "$actual" = "$tunnel_ip/32" ] || { peer_stop runtime_peer_ensure_verify_failed 74; exit $?; }
+    echo RESULT=PASS_PEER_RUNTIME_ENSURE
+    echo profile_id="$profile_id"
+    echo protocol="$protocol"
+    echo tunnel_ip="$tunnel_ip"
+    echo runtime_applied=true
+    ;;
+
   --enable)
     request="${2:-}" psk_file="${3:-}"
     [ -r "$request" ] && [ -r "$psk_file" ] || { peer_stop enable_input_missing 64; exit $?; }
@@ -185,7 +211,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo 'Usage: router-wgpay-peer-lifecycle.sh --status|--migrate-current|--refresh-selectors|--sync-from-selectors-unlocked|--enable REQUEST PSK_FILE|--disable REQUEST' >&2
+    echo 'Usage: router-wgpay-peer-lifecycle.sh --status|--migrate-current|--refresh-selectors|--sync-from-selectors-unlocked|--ensure REQUEST PSK_FILE|--enable REQUEST PSK_FILE|--disable REQUEST' >&2
     exit 64
     ;;
 esac
