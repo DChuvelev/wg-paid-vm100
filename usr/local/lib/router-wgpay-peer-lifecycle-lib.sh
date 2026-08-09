@@ -38,6 +38,8 @@ peer_selector_rows() {
 peer_registry_validate() {
     file="$1"
     [ -s "$file" ] || return 41
+    grep -Fqx '# schema=router-wgpay-peer-registry-v1' "$file" || return 51
+    grep -Fqx '# columns=profile_id protocol interface public_key tunnel_ip normal_selector active_selector desired_generation created_epoch updated_epoch' "$file" || return 52
     awk -F '\t' '
       function validip(ip,a,i){if(ip!~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)return 0;split(ip,a,".");for(i=1;i<=4;i++)if(a[i]<0||a[i]>255)return 0;return 1}
       /^#/{next}
@@ -51,7 +53,6 @@ peer_registry_validate() {
       $8!~/^[0-9]{1,20}$/ || $9!~/^[0-9]{1,20}$/ || $10!~/^[0-9]{1,20}$/{exit 49}
       seen_id[$1]++ || seen_key[$2 SUBSEP $4]++ || seen_ip[$5]++ {exit 50}
       {n++}
-      END{if(n<1)exit 51}
     ' "$file"
 }
 peer_registry_count() { awk -F '\t' '$0!~/^#/ && NF{n++} END{print n+0}' "$1"; }
@@ -145,6 +146,21 @@ peer_registry_sync_from_selectors() {
     peer_registry_validate "$registry" || return 1
     peer_selector_rows "$active" "$work/active.rows" || return 1
     peer_selector_rows "$canonical" "$work/canonical.rows" || return 1
-    awk -F '\t' 'FNR==1{file_no++} file_no==1{a[$2]=$3;next} file_no==2{c[$2]=$3;next} /^#/{print;next} {if(!($5 in a)||!($5 in c))exit 61;$6=c[$5];$7=a[$5];print}' OFS='\t' "$work/active.rows" "$work/canonical.rows" "$registry" > "$output" || return 1
+    {
+      echo '@@ACTIVE@@'
+      cat "$work/active.rows"
+      echo '@@CANONICAL@@'
+      cat "$work/canonical.rows"
+      echo '@@REGISTRY@@'
+      cat "$registry"
+    } | awk -F '\t' '
+      $0=="@@ACTIVE@@"{mode="active";next}
+      $0=="@@CANONICAL@@"{mode="canonical";next}
+      $0=="@@REGISTRY@@"{mode="registry";next}
+      mode=="active"{a[$2]=$3;next}
+      mode=="canonical"{c[$2]=$3;next}
+      mode=="registry" && /^#/{print;next}
+      mode=="registry"{if(!($5 in a)||!($5 in c))exit 61;$6=c[$5];$7=a[$5];print}
+    ' OFS='\t' > "$output" || return 1
     peer_registry_validate "$output"
 }
