@@ -144,3 +144,11 @@ config rule 'allow_wg_paid_51830'
 	option dest_port '51830'
 	option target 'ACCEPT'
 
+config rule 'router_ops_to_ddn'
+	option name 'Router-Ops-to-DDN'
+	option src 'lan'
+	option src_ip '10.71.100.84'
+	option dest 'remote_in'
+	option dest_ip '192.168.30.0/24'
+	option target 'ACCEPT'
+
