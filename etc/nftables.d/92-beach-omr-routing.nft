@@ -35,3 +35,10 @@ chain forward_transit_direct {
                 counter accept \
                 comment "BEACH_OMR_OPENVPN_65301_INBOUND"
 }
+
+chain forward_transit_direct {
+        ip daddr 10.71.100.85 \
+                tcp dport 65500 \
+                counter accept \
+                comment "BEACH_OMR_API_65500_INBOUND"
+}
