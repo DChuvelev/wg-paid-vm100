@@ -3,13 +3,35 @@ chain beach_omr_transport_direct {
 
         iifname "br-lan" ip saddr 10.71.100.85 ip dscp cs6 \
                 meta mark set meta mark & 0xff01ffff | 0x00010000 \
-                ip dscp set cs0 \
                 counter comment "BEACH_OMR_TRANSPORT_DIRECT"
 }
 
 chain srcnat_transit_direct {
         ip saddr 10.71.100.85 \
+                ip dscp cs6 \
                 meta mark & 0x00ff0000 == 0x00010000 \
                 counter return \
                 comment "BEACH_OMR_TRANSPORT_NO_SNAT"
+}
+
+chain beach_omr_transport_clear {
+        type filter hook postrouting priority srcnat + 5; policy accept;
+
+        ip saddr 10.71.100.85 \
+                ip dscp cs6 \
+                oifname "eth0" \
+                ip dscp set cs0 \
+                counter comment "BEACH_OMR_TRANSPORT_CLEAR_DSCP"
+}
+
+chain forward_transit_direct {
+        ip daddr 10.71.100.85 \
+                tcp dport 65248 \
+                counter accept \
+                comment "BEACH_OMR_XRAY_65248_INBOUND"
+
+        ip daddr 10.71.100.85 \
+                tcp dport 65301 \
+                counter accept \
+                comment "BEACH_OMR_OPENVPN_65301_INBOUND"
 }
