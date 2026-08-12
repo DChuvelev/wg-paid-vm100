@@ -6,3 +6,10 @@ chain beach_omr_transport_direct {
                 ip dscp set cs0 \
                 counter comment "BEACH_OMR_TRANSPORT_DIRECT"
 }
+
+chain srcnat_transit_direct {
+        ip saddr 10.71.100.85 \
+                meta mark & 0x00ff0000 == 0x00010000 \
+                counter return \
+                comment "BEACH_OMR_TRANSPORT_NO_SNAT"
+}
