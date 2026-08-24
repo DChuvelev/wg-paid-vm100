@@ -14,8 +14,8 @@ SELECTOR_LOCK="${ROUTER_EGRESS_SELECTOR_LOCK:-/var/run/router-wgpay-selector.loc
 TOPOLOGY_STATE_FILE="${ROUTER_EGRESS_TOPOLOGY_STATE_FILE:-/var/lib/router-wgpay-topology/state.kv}"
 SYN_ACTIVE_IPS="$(echo "${ROUTER_EGRESS_SYNTHETIC_ACTIVE_IPS:-}" | tr ',' ' ')"
 
-ACTIVE_MIN_PACKETS="${ROUTER_EGRESS_ACTIVE_MIN_PACKETS:-10}"
-ACTIVE_MIN_BYTES="${ROUTER_EGRESS_ACTIVE_MIN_BYTES:-16384}"
+ACTIVE_MIN_PACKETS="${ROUTER_EGRESS_ACTIVE_MIN_PACKETS:-1}"
+ACTIVE_MIN_BYTES="${ROUTER_EGRESS_ACTIVE_MIN_BYTES:-1}"
 IDLE_SECONDS="${ROUTER_EGRESS_IDLE_SECONDS:-900}"
 REASSIGN_COOLDOWN_SECONDS="${ROUTER_EGRESS_REASSIGN_COOLDOWN_SECONDS:-900}"
 
@@ -89,12 +89,12 @@ state_get() {
 counter_snapshot() {
   ip="$1"
   safe_ip="$(echo "$ip" | tr '.' '_')"
-  nft list table inet router_egress_activity 2>/dev/null | awk -v safe="$safe_ip" '
+  awk -v safe="$safe_ip" '
     BEGIN {op=0; ob=0; ipk=0; ib=0}
     $0 ~ "peer_" safe "_out_vpn" {for(i=1;i<=NF;i++){if($i=="packets")op=$(i+1); if($i=="bytes")ob=$(i+1)}}
     $0 ~ "peer_" safe "_in_vpn" {for(i=1;i<=NF;i++){if($i=="packets")ipk=$(i+1); if($i=="bytes")ib=$(i+1)}}
     END {print op, ob, ipk, ib}
-  '
+  ' "$COUNTER_DUMP"
 }
 
 is_synthetic_active() {
@@ -179,8 +179,41 @@ STATE_TMP="/tmp/router-wgpay-egress-local-state.$$"
 SEL_TMP="/tmp/router-wgpay-egress-local-selector.$$"
 APPLY_LOG="/tmp/router-wgpay-egress-local-apply.$$.log"
 REGISTRY_SYNC_LOG="/tmp/router-wgpay-egress-local-registry-sync.$$.log"
-trap 'rm -f "$TMP" "$STATE_TMP" "$SEL_TMP" "$SEL_TMP.before" "$APPLY_LOG" "$REGISTRY_SYNC_LOG" "${STATE_FILE}.tmp.$$"' EXIT
+COUNTER_DUMP="/tmp/router-wgpay-egress-local-counters.$$"
+PREV_STATE_TMP="/tmp/router-wgpay-egress-local-prev-state.$$"
+trap 'rm -f "$TMP" "$STATE_TMP" "$SEL_TMP" "$SEL_TMP.before" "$APPLY_LOG" "$REGISTRY_SYNC_LOG" "$COUNTER_DUMP" "$PREV_STATE_TMP" "${STATE_FILE}.tmp.$$"' EXIT
 : > "$TMP"
+nft list table inet router_egress_activity > "$COUNTER_DUMP" 2>/dev/null || : > "$COUNTER_DUMP"
+
+# Collapse the previous key/value state into one row per peer once per cycle.
+# This avoids repeatedly scanning a growing state file several times per peer.
+awk -F= '
+  function remember(key, suffix, value, ip) {
+    ip=key
+    sub(/^peer\./,"",ip)
+    sub("\\." suffix "$","",ip)
+    seen[ip]=1
+    data[ip,suffix]=value
+  }
+  /^peer\..*\.out_packets=/ {remember($1,"out_packets",substr($0,index($0,"=")+1)); next}
+  /^peer\..*\.out_bytes=/ {remember($1,"out_bytes",substr($0,index($0,"=")+1)); next}
+  /^peer\..*\.in_packets=/ {remember($1,"in_packets",substr($0,index($0,"=")+1)); next}
+  /^peer\..*\.in_bytes=/ {remember($1,"in_bytes",substr($0,index($0,"=")+1)); next}
+  /^peer\..*\.active_state=/ {remember($1,"active_state",substr($0,index($0,"=")+1)); next}
+  /^peer\..*\.assignment_pending=/ {remember($1,"assignment_pending",substr($0,index($0,"=")+1)); next}
+  /^peer\..*\.last_active_epoch=/ {remember($1,"last_active_epoch",substr($0,index($0,"=")+1)); next}
+  /^peer\..*\.last_reassign_epoch=/ {remember($1,"last_reassign_epoch",substr($0,index($0,"=")+1)); next}
+  END {
+    for (ip in seen) {
+      printf "%s %s %s %s %s %s %s %s %s\n", ip, \
+        data[ip,"out_packets"]+0, data[ip,"out_bytes"]+0, \
+        data[ip,"in_packets"]+0, data[ip,"in_bytes"]+0, \
+        (data[ip,"active_state"]=="true"?"true":"false"), \
+        (data[ip,"assignment_pending"]=="true"?"true":"false"), \
+        data[ip,"last_active_epoch"]+0, data[ip,"last_reassign_epoch"]+0
+    }
+  }
+' "$STATE_FILE" 2>/dev/null > "$PREV_STATE_TMP" || : > "$PREV_STATE_TMP"
 
 grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest; do
   [ -n "$ip" ] || continue
@@ -192,15 +225,27 @@ grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest
   inp="${3:-0}"
   inb="${4:-0}"
 
-  prev_outp="$(state_get "peer.${ip}.out_packets")"
-  prev_outb="$(state_get "peer.${ip}.out_bytes")"
-  prev_inp="$(state_get "peer.${ip}.in_packets")"
-  prev_inb="$(state_get "peer.${ip}.in_bytes")"
-  prev_last_active="$(state_get "peer.${ip}.last_active_epoch")"
-  prev_last_reassign="$(state_get "peer.${ip}.last_reassign_epoch")"
-
-  [ -n "$prev_last_active" ] || prev_last_active=0
-  [ -n "$prev_last_reassign" ] || prev_last_reassign=0
+  prev="$(awk -v ip="$ip" '$1==ip {print; exit}' "$PREV_STATE_TMP")"
+  set -- $prev
+  if [ "${1:-}" = "$ip" ]; then
+    prev_outp="${2:-0}"
+    prev_outb="${3:-0}"
+    prev_inp="${4:-0}"
+    prev_inb="${5:-0}"
+    prev_active_state="${6:-false}"
+    prev_assignment_pending="${7:-false}"
+    prev_last_active="${8:-0}"
+    prev_last_reassign="${9:-0}"
+  else
+    prev_outp=0
+    prev_outb=0
+    prev_inp=0
+    prev_inb=0
+    prev_active_state=false
+    prev_assignment_pending=false
+    prev_last_active=0
+    prev_last_reassign=0
+  fi
 
   delta_outp="$(safe_delta "$outp" "$prev_outp")"
   delta_outb="$(safe_delta "$outb" "$prev_outb")"
@@ -231,8 +276,15 @@ grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest
     cooldown_ok=false
   fi
 
-  printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
-    "$ip" "$cls" "$tag" "$active_now" "$active_state" "$cooldown_ok" \
+  assignment_pending=false
+  if [ "$active_state" = true ]; then
+    if [ "$prev_assignment_pending" = true ] || { [ "$active_now" = true ] && [ "$prev_active_state" != true ]; }; then
+      assignment_pending=true
+    fi
+  fi
+
+  printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
+    "$ip" "$cls" "$tag" "$active_now" "$active_state" "$prev_active_state" "$assignment_pending" "$cooldown_ok" \
     "$outp" "$outb" "$inp" "$inb" "$delta_packets" "$delta_bytes" "$last_active" "$prev_last_reassign" >> "$TMP"
 done
 
@@ -264,6 +316,7 @@ fi
 rows="$(wc -l < "$TMP" | tr -d ' ')"
 active_now_count="$(awk '$4=="true"{c++} END{print c+0}' "$TMP")"
 active_state_count="$(awk '$5=="true"{c++} END{print c+0}' "$TMP")"
+assignment_pending_count_before="$(awk '$7=="true"{c++} END{print c+0}' "$TMP")"
 idle_count="$(awk '$5!="true"{c++} END{print c+0}' "$TMP")"
 exhausted_row_count="$(awk -v exhausted="$EXHAUSTED_CLASSES" '
   function has(csv,item,a,n,i){if(csv=="")return 0;n=split(csv,a,",");for(i=1;i<=n;i++)if(a[i]==item)return 1;return 0}
@@ -276,7 +329,7 @@ min_count=999
 max_count=-1
 for cls in $CLASSES; do
   csv_contains "$ALLOWED_CLASSES" "$cls" || continue
-  c="$(awk -v cls="$cls" '$2==cls{n++} END{print n+0}' "$TMP")"
+  c="$(awk -v cls="$cls" '$2==cls && $5=="true" && $7!="true"{n++} END{print n+0}' "$TMP")"
   if [ "$c" -lt "$min_count" ]; then min_count="$c"; min_class="$cls"; fi
   if [ "$c" -gt "$max_count" ]; then max_count="$c"; max_class="$cls"; fi
 done
@@ -311,23 +364,18 @@ if [ "$blocked" = false ]; then
       action_reason=exhausted_row_selection_failed
     fi
   else
-    diff=$((max_count - min_count))
-    if [ "$diff" -gt 1 ]; then
-      movable="$(awk -v cls="$max_class" '$2==cls && $5!="true" && $6=="true"{print; exit}' "$TMP")"
-      if [ -n "$movable" ]; then
-        set -- $movable
-        action_ip="$1"
-        action_from_class="$2"
-        action_from_target="$3"
-        action_to_class="$min_class"
-        action_to_target="$(target_for_class "$min_class")"
-        action_reason=idle_state_rebalance_most_loaded_to_least_loaded
-        action_count=1
-      else
-        action_reason=no_idle_cooldown_ok_peer_on_most_loaded_class
-      fi
+    movable="$(awk '$7=="true"{print; exit}' "$TMP")"
+    if [ -n "$movable" ]; then
+      set -- $movable
+      action_ip="$1"
+      action_from_class="$2"
+      action_from_target="$3"
+      action_to_class="$min_class"
+      action_to_target="$(target_for_class "$min_class")"
+      action_reason=idle_to_active_assign_least_loaded
+      action_count=1
     else
-      action_reason=already_balanced
+      action_reason=no_pending_idle_to_active_assignment
     fi
   fi
 else
@@ -336,6 +384,10 @@ fi
 
 noop=true
 [ "$action_count" -gt 0 ] && noop=false
+assignment_pending_count="$assignment_pending_count_before"
+if [ "$action_count" -gt 0 ] && [ "$action_reason" = idle_to_active_assign_least_loaded ]; then
+  assignment_pending_count=$((assignment_pending_count_before - 1))
+fi
 
 selector_would_change=false
 selector_apply_would_run=false
@@ -344,7 +396,7 @@ if { [ "$MODE" = --state-write ] || [ "$MODE" = --commit ]; } && [ "$fatal_topol
   state_file_would_write=true
 fi
 if [ "$MODE" = --apply-preview ] || [ "$MODE" = --state-preview ] || [ "$MODE" = --state-write ] || [ "$MODE" = --commit ]; then
-  if [ "$action_count" -gt 0 ]; then
+  if [ "$action_count" -gt 0 ] && { [ "$action_from_class" != "$action_to_class" ] || [ "$action_from_target" != "$action_to_target" ]; }; then
     selector_would_change=true
     selector_apply_would_run=true
   fi
@@ -368,6 +420,8 @@ fi
   echo "exhausted_row_count=$exhausted_row_count"
   echo "active_now_count=$active_now_count"
   echo "active_state_count=$active_state_count"
+  echo "assignment_pending_count_before=$assignment_pending_count_before"
+  echo "assignment_pending_count=$assignment_pending_count"
   echo "idle_count=$idle_count"
   echo "idle_seconds=$IDLE_SECONDS"
   echo "reassign_cooldown_seconds=$REASSIGN_COOLDOWN_SECONDS"
@@ -390,13 +444,24 @@ fi
   echo "selector_apply_would_run=$selector_apply_would_run"
   echo "state_file_would_write=$state_file_would_write"
 
-  while read -r ip cls tag active_now active_state cooldown_ok outp outb inp inb delta_packets delta_bytes last_active last_reassign; do
+  while read -r ip cls tag active_now active_state prev_active_state assignment_pending cooldown_ok outp outb inp inb delta_packets delta_bytes last_active last_reassign; do
     next_last_reassign="$last_reassign"
-    if [ "$action_count" -gt 0 ] && [ "$ip" = "$action_ip" ]; then next_last_reassign="$NOW"; fi
-    echo "peer.${ip}.class=$cls"
-    echo "peer.${ip}.target=$tag"
+    next_assignment_pending="$assignment_pending"
+    if [ "$action_count" -gt 0 ] && [ "$ip" = "$action_ip" ]; then
+      next_last_reassign="$NOW"
+      next_assignment_pending=false
+    fi
+    next_class="$cls"
+    next_target="$tag"
+    if [ "$action_count" -gt 0 ] && [ "$ip" = "$action_ip" ]; then
+      next_class="$action_to_class"
+      next_target="$action_to_target"
+    fi
+    echo "peer.${ip}.class=$next_class"
+    echo "peer.${ip}.target=$next_target"
     echo "peer.${ip}.active_now=$active_now"
     echo "peer.${ip}.active_state=$active_state"
+    echo "peer.${ip}.assignment_pending=$next_assignment_pending"
     echo "peer.${ip}.cooldown_ok=$cooldown_ok"
     echo "peer.${ip}.out_packets=$outp"
     echo "peer.${ip}.out_bytes=$outb"
@@ -429,7 +494,7 @@ if [ "$MODE" = --state-write ] && [ "$fatal_topology_state" != true ]; then
 fi
 
 if [ "$MODE" = --commit ] && [ "$fatal_topology_state" != true ]; then
-  if [ "$action_count" -gt 0 ]; then
+  if [ "$action_count" -gt 0 ] && [ "$selector_would_change" = true ]; then
     awk -v ip="$action_ip" -v cls="$action_to_class" -v tag="$action_to_target" '
       $1==ip {print ip " " cls " " tag; changed=1; next}
       {print}
@@ -464,6 +529,9 @@ if [ "$MODE" = --commit ] && [ "$fatal_topology_state" != true ]; then
     else
       [ -x "$APPLY" ] || selector_apply_rc=apply_script_missing
     fi
+  elif [ "$action_count" -gt 0 ]; then
+    selector_update_rc=0
+    selector_apply_rc=0
   else
     selector_update_rc=noop
     selector_apply_rc=noop
@@ -511,7 +579,7 @@ echo "  \"reassign_cooldown_seconds\": $REASSIGN_COOLDOWN_SECONDS,"
 echo '  "rows": ['
 
 first=1
-while read -r ip cls tag active_now active_state cooldown_ok outp outb inp inb delta_packets delta_bytes last_active last_reassign; do
+while read -r ip cls tag active_now active_state prev_active_state assignment_pending cooldown_ok outp outb inp inb delta_packets delta_bytes last_active last_reassign; do
   expected="$(target_for_class "$cls")"
   match=false
   [ "$tag" = "$expected" ] && match=true
@@ -521,8 +589,8 @@ while read -r ip cls tag active_now active_state cooldown_ok outp outb inp inb d
   csv_contains "$EXHAUSTED_CLASSES" "$cls" && exhausted=true
   [ "$first" = 0 ] && echo ','
   first=0
-  printf '    {"tunnel_ip":"%s","egress_class":"%s","target_id":"%s","expected_target_id":"%s","selector_target_match":%s,"selector_allowed":%s,"selector_exhausted":%s,"active_now":%s,"active_state":%s,"cooldown_ok":%s,"out_packets":%s,"in_packets":%s,"delta_packets":%s,"delta_bytes":%s,"last_active_epoch":%s,"last_reassign_epoch":%s}' \
-    "$ip" "$cls" "$tag" "$expected" "$match" "$allowed" "$exhausted" "$active_now" "$active_state" "$cooldown_ok" "$outp" "$inp" "$delta_packets" "$delta_bytes" "$last_active" "$last_reassign"
+  printf '    {"tunnel_ip":"%s","egress_class":"%s","target_id":"%s","expected_target_id":"%s","selector_target_match":%s,"selector_allowed":%s,"selector_exhausted":%s,"active_now":%s,"active_state":%s,"previous_active_state":%s,"assignment_pending":%s,"cooldown_ok":%s,"out_packets":%s,"in_packets":%s,"delta_packets":%s,"delta_bytes":%s,"last_active_epoch":%s,"last_reassign_epoch":%s}' \
+    "$ip" "$cls" "$tag" "$expected" "$match" "$allowed" "$exhausted" "$active_now" "$active_state" "$prev_active_state" "$assignment_pending" "$cooldown_ok" "$outp" "$inp" "$delta_packets" "$delta_bytes" "$last_active" "$last_reassign"
 done < "$TMP"
 
 echo
@@ -556,6 +624,8 @@ echo '  "summary": {'
 echo "    \"rows\": $rows,"
 echo "    \"active_now_count\": $active_now_count,"
 echo "    \"active_state_count\": $active_state_count,"
+echo "    \"assignment_pending_count_before\": $assignment_pending_count_before,"
+  echo "    \"assignment_pending_count\": $assignment_pending_count,"
 echo "    \"idle_count\": $idle_count,"
 echo "    \"exhausted_row_count\": $exhausted_row_count,"
 echo "    \"min_class\": \"$min_class\","
