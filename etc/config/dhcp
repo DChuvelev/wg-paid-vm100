@@ -18,6 +18,7 @@ config dnsmasq
 	list server '8.8.8.8'
 	list server '9.9.9.9'
 	list addnmount '/var/run/pbr.dnsmasq'
+	list address '/admin.secret-studio.ru/10.71.100.86'
 
 config dhcp 'lan'
 	option interface 'lan'
