@@ -14,6 +14,7 @@ config dnsmasq
 	option localservice '1'
 	option ednspacket_max '1232'
 	option noresolv '1'
+	option strictorder '1'
 	list server '1.1.1.1'
 	list server '8.8.8.8'
 	list server '9.9.9.9'
