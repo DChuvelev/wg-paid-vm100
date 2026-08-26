@@ -5,8 +5,8 @@ export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 TOPOLOGY_CONFIG="${ROUTER_TOPOLOGY_CONFIG:-/etc/router-wgpay-slot-topology.conf}"
 TOPOLOGY_LIB="${ROUTER_TOPOLOGY_LIB:-/usr/local/lib/router-wgpay-slot-topology-lib.sh}"
-TOPOLOGY_SELECTOR_FILE="${ROUTER_TOPOLOGY_SELECTOR_FILE:-/etc/router-wgpay-selector.d/peers.conf}"
-TOPOLOGY_CANONICAL_SELECTOR_FILE="${ROUTER_TOPOLOGY_CANONICAL_SELECTOR_FILE:-/etc/router-wgpay-selector.d/canonical.conf}"
+TOPOLOGY_SELECTOR_FILE="${ROUTER_TOPOLOGY_SELECTOR_FILE:-/etc/router-wgpay-peer-state/peers.conf}"
+TOPOLOGY_CANONICAL_SELECTOR_FILE="${ROUTER_TOPOLOGY_CANONICAL_SELECTOR_FILE:-/etc/router-wgpay-peer-state/canonical.conf}"
 TOPOLOGY_STATE_DIR="${ROUTER_TOPOLOGY_STATE_DIR:-/var/lib/router-wgpay-topology}"
 TOPOLOGY_STATE_FILE="${ROUTER_TOPOLOGY_STATE_FILE:-${TOPOLOGY_STATE_DIR}/state.kv}"
 TOPOLOGY_PLAN_FILE="${ROUTER_TOPOLOGY_PLAN_FILE:-${TOPOLOGY_STATE_DIR}/plan.kv}"
