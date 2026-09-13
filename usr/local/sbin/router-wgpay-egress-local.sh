@@ -90,9 +90,17 @@ counter_snapshot() {
   ip="$1"
   safe_ip="$(echo "$ip" | tr '.' '_')"
   awk -v safe="$safe_ip" '
-    BEGIN {op=0; ob=0; ipk=0; ib=0}
-    $0 ~ "peer_" safe "_out_vpn" {for(i=1;i<=NF;i++){if($i=="packets")op=$(i+1); if($i=="bytes")ob=$(i+1)}}
-    $0 ~ "peer_" safe "_in_vpn" {for(i=1;i<=NF;i++){if($i=="packets")ipk=$(i+1); if($i=="bytes")ib=$(i+1)}}
+    BEGIN {op=0; ob=0; ipk=0; ib=0; want=""}
+    $0 ~ "counter peer_" safe "_out_vpn" {want="out"; next}
+    $0 ~ "counter peer_" safe "_in_vpn" {want="in"; next}
+    want != "" && /packets[[:space:]]+[0-9]+[[:space:]]+bytes[[:space:]]+[0-9]+/ {
+      for(i=1;i<=NF;i++){
+        if($i=="packets"){ if(want=="out")op=$(i+1); else ipk=$(i+1) }
+        if($i=="bytes"){ if(want=="out")ob=$(i+1); else ib=$(i+1) }
+      }
+      want=""
+    }
+    /^}/ {want=""}
     END {print op, ob, ipk, ib}
   ' "$COUNTER_DUMP"
 }
@@ -181,6 +189,10 @@ APPLY_LOG="/tmp/router-wgpay-egress-local-apply.$$.log"
 REGISTRY_SYNC_LOG="/tmp/router-wgpay-egress-local-registry-sync.$$.log"
 COUNTER_DUMP="/tmp/router-wgpay-egress-local-counters.$$"
 PREV_STATE_TMP="/tmp/router-wgpay-egress-local-prev-state.$$"
+COUNTER_SNAPSHOT_FORMAT="nft-multiline-v1"
+PREV_COUNTER_SNAPSHOT_FORMAT="$(kv_get_file counter_snapshot_format "$STATE_FILE")"
+COUNTER_BASELINE_READY=false
+[ "$PREV_COUNTER_SNAPSHOT_FORMAT" = "$COUNTER_SNAPSHOT_FORMAT" ] && COUNTER_BASELINE_READY=true
 trap 'rm -f "$TMP" "$STATE_TMP" "$SEL_TMP" "$SEL_TMP.before" "$APPLY_LOG" "$REGISTRY_SYNC_LOG" "$COUNTER_DUMP" "$PREV_STATE_TMP" "${STATE_FILE}.tmp.$$"' EXIT
 : > "$TMP"
 nft list table inet router_egress_activity > "$COUNTER_DUMP" 2>/dev/null || : > "$COUNTER_DUMP"
@@ -245,6 +257,13 @@ grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest
     prev_assignment_pending=false
     prev_last_active=0
     prev_last_reassign=0
+  fi
+
+  if [ "$COUNTER_BASELINE_READY" != true ]; then
+    prev_outp="$outp"
+    prev_outb="$outb"
+    prev_inp="$inp"
+    prev_inb="$inb"
   fi
 
   delta_outp="$(safe_delta "$outp" "$prev_outp")"
@@ -404,6 +423,7 @@ fi
 
 {
   echo schema=router-wgpay-egress-local-state-v3
+  echo "counter_snapshot_format=$COUNTER_SNAPSHOT_FORMAT"
   echo "generated_epoch=$NOW"
   echo "selector_file=$SEL"
   echo "state_file=$STATE_FILE"
