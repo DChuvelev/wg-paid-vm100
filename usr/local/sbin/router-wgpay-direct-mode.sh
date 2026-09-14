@@ -15,7 +15,9 @@ NFT_BIN="${ROUTER_WGPAY_DIRECT_NFT_BIN:-nft}"
 NFT_FAMILY="${ROUTER_WGPAY_DIRECT_NFT_FAMILY:-${TOPOLOGY_DIRECT_NFT_FAMILY:-inet}}"
 NFT_TABLE="${ROUTER_WGPAY_DIRECT_NFT_TABLE:-${TOPOLOGY_DIRECT_NFT_TABLE:-fw4}}"
 VPN_SET="${ROUTER_WGPAY_DIRECT_VPN_SOURCE_SET:-${TOPOLOGY_DIRECT_VPN_SOURCE_SET:-pbr_transit_vpn_4_src_ip_user}}"
-PAID_CIDR="${ROUTER_WGPAY_DIRECT_PAID_SOURCE_CIDR:-${TOPOLOGY_DIRECT_PAID_SOURCE_CIDR:-10.253.0.0/16}}"
+LEGACY_PAID_CIDR="${ROUTER_WGPAY_DIRECT_PAID_SOURCE_CIDR:-${TOPOLOGY_DIRECT_PAID_SOURCE_CIDR:-10.253.0.0/16}}"
+AWG_PAID_CIDR="${ROUTER_WGPAY_DIRECT_AWG_SOURCE_CIDR:-${TOPOLOGY_DIRECT_AWG_SOURCE_CIDR:-10.254.0.0/16}}"
+PAID_CIDRS="${ROUTER_WGPAY_DIRECT_PAID_SOURCE_CIDRS:-${TOPOLOGY_DIRECT_PAID_SOURCE_CIDRS:-$LEGACY_PAID_CIDR $AWG_PAID_CIDR}}"
 NOW="${ROUTER_WGPAY_DIRECT_NOW_EPOCH:-$(date +%s)}"
 SCHEMA=router-wgpay-direct-mode-state-v1
 TEST_FAULT="${ROUTER_WGPAY_DIRECT_TEST_FAULT:-}"
@@ -42,6 +44,9 @@ if [ "$mode" = --request ]; then
     mode=--enable
 fi
 
+set -- $PAID_CIDRS
+[ "$#" -gt 0 ] || { echo RESULT=STOP_DIRECT_PAID_SOURCE_LIST_EMPTY; exit 70; }
+
 mkdir -p "$STATE_DIR" "$(dirname "$LOCK_FILE")" || exit 70
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 exec 9>"$LOCK_FILE"
@@ -49,7 +54,23 @@ flock -n 9 || { echo RESULT=NOOP_DIRECT_MODE_LOCKED; exit 75; }
 
 atomic_write() { src="$1" dst="$2"; cp "$src" "$dst.tmp.$$" && chmod 600 "$dst.tmp.$$" && mv "$dst.tmp.$$" "$dst"; }
 set_dump() { "$NFT_BIN" list set "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" 2>/dev/null; }
-set_contains_paid() { set_dump | grep -Fq "$PAID_CIDR"; }
+set_contains_cidr() {
+    cidr="$1"
+    probe="${cidr%/*}"
+    printf 'get element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$probe" | "$NFT_BIN" -f - >/dev/null 2>&1
+}
+paid_total() { n=0; for cidr in $PAID_CIDRS; do n=$((n + 1)); done; echo "$n"; }
+paid_present_count() { n=0; for cidr in $PAID_CIDRS; do set_contains_cidr "$cidr" && n=$((n + 1)); done; echo "$n"; }
+snapshot_membership() { out=''; for cidr in $PAID_CIDRS; do if set_contains_cidr "$cidr"; then out="$out $cidr"; fi; done; echo "${out# }"; }
+add_cidr() { cidr="$1"; printf 'add element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$cidr" | "$NFT_BIN" -f -; }
+delete_cidr() { cidr="$1"; printf 'delete element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$cidr" | "$NFT_BIN" -f -; }
+add_all_paid() { for cidr in $PAID_CIDRS; do set_contains_cidr "$cidr" || add_cidr "$cidr" || return 1; done; }
+delete_all_paid() { for cidr in $PAID_CIDRS; do if set_contains_cidr "$cidr"; then delete_cidr "$cidr" || return 1; fi; done; }
+restore_membership() {
+    desired="$1"
+    delete_all_paid >/dev/null 2>&1 || return 1
+    for cidr in $desired; do add_cidr "$cidr" >/dev/null 2>&1 || return 1; done
+}
 write_state() {
     active="$1"; state_mode="$2"; result="$3"
     [ "$TEST_FAULT" != state_write ] || return 1
@@ -62,7 +83,8 @@ write_state() {
         echo reason="$reason"
         echo source_vm101_generation="$source_generation"
         echo topology_generation="$topology_generation"
-        echo paid_source_cidr="$PAID_CIDR"
+        echo paid_source_cidr="$LEGACY_PAID_CIDR"
+        echo paid_source_cidrs="$PAID_CIDRS"
         echo vpn_source_set="$VPN_SET"
         echo last_result="$result"
     } > "$tmp" || return 1
@@ -71,28 +93,40 @@ write_state() {
 }
 
 set_dump >/dev/null 2>&1 || { echo RESULT=STOP_DIRECT_VPN_SOURCE_SET_MISSING; echo VPN_SOURCE_SET="$VPN_SET"; exit 70; }
+TOTAL="$(paid_total)"
+PRESENT="$(paid_present_count)"
 
 if [ "$mode" = --probe ]; then
-    if set_contains_paid; then probe_active=false; else probe_active=true; fi
+    if [ "$PRESENT" -eq "$TOTAL" ]; then
+        probe_active=false
+    elif [ "$PRESENT" -eq 0 ]; then
+        probe_active=true
+    else
+        echo RESULT=STOP_DIRECT_PAID_SOURCE_SET_PARTIAL
+        echo PAID_SOURCE_TOTAL="$TOTAL"
+        echo PAID_SOURCE_PRESENT="$PRESENT"
+        exit 72
+    fi
     echo RESULT=PASS_DIRECT_MODE_PROBE
     echo DIRECT_MODE_ACTIVE="$probe_active"
     echo DIRECT_MODE_CHANGED=false
+    echo PAID_SOURCE_CIDRS="$PAID_CIDRS"
     exit 0
 fi
 
 if [ "$mode" = --enable ]; then
-    if ! set_contains_paid; then
+    if [ "$PRESENT" -eq 0 ]; then
         write_state true DIRECT NOOP_ALREADY_DIRECT || exit 70
         echo RESULT=NOOP_DIRECT_ALREADY_ACTIVE
         echo DIRECT_MODE_ACTIVE=true
         echo DIRECT_MODE_CHANGED=false
         exit 0
     fi
-    printf 'delete element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - || { echo RESULT=STOP_DIRECT_NFT_ENABLE_FAILED; exit 71; }
-    ! set_contains_paid || { echo RESULT=STOP_DIRECT_NFT_ENABLE_VERIFY; exit 72; }
+    before_membership="$(snapshot_membership)"
+    delete_all_paid || { echo RESULT=STOP_DIRECT_NFT_ENABLE_FAILED; exit 71; }
+    [ "$(paid_present_count)" -eq 0 ] || { echo RESULT=STOP_DIRECT_NFT_ENABLE_VERIFY; exit 72; }
     if ! write_state true DIRECT PASS_DIRECT_ENABLED; then
-        printf 'add element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - >/dev/null 2>&1 || true
-        set_contains_paid || { echo RESULT=STOP_DIRECT_ENABLE_STATE_ROLLBACK_FAILED; exit 74; }
+        restore_membership "$before_membership" || { echo RESULT=STOP_DIRECT_ENABLE_STATE_ROLLBACK_FAILED; exit 74; }
         echo RESULT=STOP_DIRECT_STATE_WRITE_FAILED
         exit 73
     fi
@@ -102,18 +136,18 @@ if [ "$mode" = --enable ]; then
     exit 0
 fi
 
-if set_contains_paid; then
+if [ "$PRESENT" -eq "$TOTAL" ]; then
     write_state false NORMAL NOOP_ALREADY_NORMAL || exit 70
     echo RESULT=NOOP_DIRECT_ALREADY_DISABLED
     echo DIRECT_MODE_ACTIVE=false
     echo DIRECT_MODE_CHANGED=false
     exit 0
 fi
-printf 'add element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - || { echo RESULT=STOP_DIRECT_NFT_DISABLE_FAILED; exit 71; }
-set_contains_paid || { echo RESULT=STOP_DIRECT_NFT_DISABLE_VERIFY; exit 72; }
+before_membership="$(snapshot_membership)"
+add_all_paid || { echo RESULT=STOP_DIRECT_NFT_DISABLE_FAILED; exit 71; }
+[ "$(paid_present_count)" -eq "$TOTAL" ] || { echo RESULT=STOP_DIRECT_NFT_DISABLE_VERIFY; exit 72; }
 if ! write_state false NORMAL PASS_DIRECT_DISABLED; then
-    printf 'delete element %s %s %s { %s }\n' "$NFT_FAMILY" "$NFT_TABLE" "$VPN_SET" "$PAID_CIDR" | "$NFT_BIN" -f - >/dev/null 2>&1 || true
-    ! set_contains_paid || { echo RESULT=STOP_DIRECT_DISABLE_STATE_ROLLBACK_FAILED; exit 74; }
+    restore_membership "$before_membership" || { echo RESULT=STOP_DIRECT_DISABLE_STATE_ROLLBACK_FAILED; exit 74; }
     echo RESULT=STOP_DIRECT_STATE_WRITE_FAILED
     exit 73
 fi
