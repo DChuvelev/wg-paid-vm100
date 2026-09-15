@@ -44,6 +44,7 @@ config zone
 	option output 'ACCEPT'
 	option forward 'ACCEPT'
 	list network 'wg_remote'
+	list network 'awg_remote'
 
 config forwarding
 	option src 'remote_in'
@@ -63,6 +64,14 @@ config rule
 	list proto 'udp'
 	list dest_ip '10.201.0.1'
 	option dest_port '51820'
+	option target 'ACCEPT'
+
+config rule
+	option src 'transit_direct'
+	option name 'Allow-AWG-Remote-In'
+	list proto 'udp'
+	list dest_ip '10.201.0.1'
+	option dest_port '51832'
 	option target 'ACCEPT'
 
 config rule
