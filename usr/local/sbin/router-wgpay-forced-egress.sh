@@ -25,8 +25,8 @@ STATE_SCHEMA=router-wgpay-forced-egress-state-v1
 RULE_COMMENT=WGPAY_FORCED_NO_DIRECT
 
 mode="${1:---status}"
-case "$mode" in --set|--clear|--reconcile|--status|--teardown-runtime) ;; *)
-  echo 'Usage: router-wgpay-forced-egress.sh --set OVERRIDE_ID {cs1..cs5} TUNNEL_IP... | --clear OVERRIDE_ID | --reconcile | --status | --teardown-runtime' >&2
+case "$mode" in --set|--set-until|--clear|--reconcile|--status|--teardown-runtime) ;; *)
+  echo 'Usage: router-wgpay-forced-egress.sh --set OVERRIDE_ID {cs1..cs5} TUNNEL_IP... | --set-until OVERRIDE_ID {cs1..cs5} EXPIRES_EPOCH TUNNEL_IP... | --clear OVERRIDE_ID | --reconcile | --status | --teardown-runtime' >&2
   exit 64
 ;; esac
 
@@ -34,6 +34,7 @@ valid_id(){ printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$'; }
 valid_selector(){ case "$1" in cs1|cs2|cs3|cs4|cs5) return 0;; *) return 1;; esac; }
 valid_ipv4(){ printf '%s\n' "$1" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++) if($i!~/^[0-9]+$/ || $i<0 || $i>255) exit 1}'; }
 valid_epoch(){ printf '%s' "$1" | grep -Eq '^[0-9]{1,20}$'; }
+MAX_FUTURE_SKEW_SECONDS=30
 state_header(){ printf '%s\n' '# schema=router-wgpay-forced-egress-state-v1' '# columns=override_id selector expires_epoch tunnel_ip'; }
 atomic_write(){ src="$1" dst="$2"; cp "$src" "$dst.tmp.$$" && chmod 600 "$dst.tmp.$$" && mv "$dst.tmp.$$" "$dst"; }
 stop(){ echo RESULT=STOP_FORCED_EGRESS; echo "STOP_REASON=$1"; exit "${2:-70}"; }
@@ -176,13 +177,22 @@ case "$mode" in
     echo active_tunnel_ip_count="$(active_count)"
     echo RESULT=PASS_FORCED_EGRESS_RECONCILED
     ;;
-  --set)
-    override="${2:-}"; selector="${3:-}"; shift 3 || true
+  --set|--set-until)
+    override="${2:-}"; selector="${3:-}"
     valid_id "$override" || stop override_id_invalid 64
     valid_selector "$selector" || stop selector_invalid 64
-    [ "$#" -ge 1 ] || stop tunnel_ip_list_empty 64
     [ "$TTL_SECONDS" = 1800 ] || stop ttl_contract_mismatch 70
-    expires=$((NOW + TTL_SECONDS))
+    if [ "$mode" = --set-until ]; then
+      expires="${4:-}"; shift 4 || true
+      valid_epoch "$expires" || stop expires_epoch_invalid 64
+      [ "$expires" -gt "$NOW" ] || stop expires_epoch_not_future 64
+      max_expires=$((NOW + TTL_SECONDS + MAX_FUTURE_SKEW_SECONDS))
+      [ "$expires" -le "$max_expires" ] || stop expires_epoch_exceeds_ttl_window 64
+    else
+      shift 3 || true
+      expires=$((NOW + TTL_SECONDS))
+    fi
+    [ "$#" -ge 1 ] || stop tunnel_ip_list_empty 64
     work="$STATE_DIR/state.set.$$"
     prune_state_to "$work.base"
     { state_header; awk -F '\t' -v id="$override" 'BEGIN{OFS="\t"} $0!~/^#/ && $1!=id {print $1,$2,$3,$4}' "$work.base"; } > "$work"
@@ -200,8 +210,9 @@ case "$mode" in
     echo SELECTOR="$selector"
     echo EXPIRES_EPOCH="$expires"
     echo TTL_SECONDS="$TTL_SECONDS"
+    echo REMAINING_SECONDS=$((expires - NOW))
     echo TUNNEL_IP_COUNT="$#"
-    echo RESULT=PASS_FORCED_EGRESS_SET
+    if [ "$mode" = --set-until ]; then echo RESULT=PASS_FORCED_EGRESS_SET_UNTIL; else echo RESULT=PASS_FORCED_EGRESS_SET; fi
     ;;
   --clear)
     override="${2:-}"
