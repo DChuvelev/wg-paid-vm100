@@ -113,14 +113,14 @@ is_synthetic_active() {
   return 1
 }
 
-safe_delta() {
-  cur="$1"
-  prev="$2"
-  [ -n "$prev" ] || prev=0
-  if [ "$cur" -ge "$prev" ] 2>/dev/null; then
-    echo $((cur - prev))
+safe_delta_result() {
+  sd_cur="$1"
+  sd_prev="$2"
+  [ -n "$sd_prev" ] || sd_prev=0
+  if [ "$sd_cur" -ge "$sd_prev" ] 2>/dev/null; then
+    sd_result=$((sd_cur - sd_prev))
   else
-    echo "$cur"
+    sd_result="$sd_cur"
   fi
 }
 
@@ -189,11 +189,12 @@ APPLY_LOG="/tmp/router-wgpay-egress-local-apply.$$.log"
 REGISTRY_SYNC_LOG="/tmp/router-wgpay-egress-local-registry-sync.$$.log"
 COUNTER_DUMP="/tmp/router-wgpay-egress-local-counters.$$"
 PREV_STATE_TMP="/tmp/router-wgpay-egress-local-prev-state.$$"
+JOIN_TMP="/tmp/router-wgpay-egress-local-joined.$$"
 COUNTER_SNAPSHOT_FORMAT="nft-multiline-v1"
 PREV_COUNTER_SNAPSHOT_FORMAT="$(kv_get_file counter_snapshot_format "$STATE_FILE")"
 COUNTER_BASELINE_READY=false
 [ "$PREV_COUNTER_SNAPSHOT_FORMAT" = "$COUNTER_SNAPSHOT_FORMAT" ] && COUNTER_BASELINE_READY=true
-trap 'rm -f "$TMP" "$STATE_TMP" "$SEL_TMP" "$SEL_TMP.before" "$APPLY_LOG" "$REGISTRY_SYNC_LOG" "$COUNTER_DUMP" "$PREV_STATE_TMP" "${STATE_FILE}.tmp.$$"' EXIT
+trap 'rm -f "$TMP" "$STATE_TMP" "$SEL_TMP" "$SEL_TMP.before" "$APPLY_LOG" "$REGISTRY_SYNC_LOG" "$COUNTER_DUMP" "$PREV_STATE_TMP" "$JOIN_TMP" "${STATE_FILE}.tmp.$$"' EXIT
 : > "$TMP"
 nft list table inet router_egress_activity > "$COUNTER_DUMP" 2>/dev/null || : > "$COUNTER_DUMP"
 
@@ -227,38 +228,75 @@ awk -F= '
   }
 ' "$STATE_FILE" 2>/dev/null > "$PREV_STATE_TMP" || : > "$PREV_STATE_TMP"
 
-grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest; do
-  [ -n "$ip" ] || continue
+# Read each nft counter block and previous row only once per pass.
+# Preserve original counter_snapshot multiline grammar and per-direction last-wins.
+# Only supported selector input domain: whitespace-separated tunnel IP/class/target.
+awk '
+  FILENAME == ARGV[1] {
+    line=$0
+    if (line ~ /counter peer_[0-9_]+_out_vpn/) {
+      name=line; sub(/^.*counter peer_/,"",name); sub(/_out_vpn.*$/,"",name)
+      gsub(/_/,".",name); want="out"; current=name; next
+    }
+    if (line ~ /counter peer_[0-9_]+_in_vpn/) {
+      name=line; sub(/^.*counter peer_/,"",name); sub(/_in_vpn.*$/,"",name)
+      gsub(/_/,".",name); want="in"; current=name; next
+    }
+    if (want != "" && line ~ /packets[[:space:]]+[0-9]+[[:space:]]+bytes[[:space:]]+[0-9]+/) {
+      for (i=1; i<=NF; i++) {
+        if ($i == "packets") counters[current, want, "packets"]=$(i+1)
+        if ($i == "bytes") counters[current, want, "bytes"]=$(i+1)
+      }
+      want=""
+    }
+    if (line ~ /^}/) want=""
+    next
+  }
+  FILENAME == ARGV[2] {
+    if (NF >= 9 && !($1 in previous)) {
+      previous[$1]=$0
+    }
+    next
+  }
+  FILENAME == ARGV[3] {
+    if ($0 ~ /^[[:space:]]*(#|$)/ || NF < 1) next
+    join_emitted++
+    ip=$1; cls=$2; tag=$3
+    outp=((ip SUBSEP "out" SUBSEP "packets") in counters)?counters[ip,"out","packets"]:"0"
+    outb=((ip SUBSEP "out" SUBSEP "bytes") in counters)?counters[ip,"out","bytes"]:"0"
+    inp=((ip SUBSEP "in" SUBSEP "packets") in counters)?counters[ip,"in","packets"]:"0"
+    inb=((ip SUBSEP "in" SUBSEP "bytes") in counters)?counters[ip,"in","bytes"]:"0"
+    if (ip in previous) {
+      split(previous[ip], p)
+      printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n", ip,cls,tag,outp,outb,inp,inb,p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9]
+    } else {
+      printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n", ip,cls,tag,outp,outb,inp,inb,"0","0","0","0","false","false","0","0"
+    }
+  }
+  END { printf "#JOIN_END %d\n", join_emitted+0 }
+' "$COUNTER_DUMP" "$PREV_STATE_TMP" "$SEL" > "$JOIN_TMP" || {
+  printf '%s\n' 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2
+  exit 70
+}
 
-  vals="$(counter_snapshot "$ip")"
-  set -- $vals
-  outp="${1:-0}"
-  outb="${2:-0}"
-  inp="${3:-0}"
-  inb="${4:-0}"
+# Independent cardinality plus EOF evidence rejects logically incomplete output,
+# including an awk wrapper/process that returns 0 after emitting only a prefix.
+expected_join_rows="$(grep -Evc '^[[:space:]]*(#|$)' "$SEL")" || {
+  [ "$expected_join_rows" = 0 ] || { echo 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2; exit 70; }
+}
+join_last_line="$(tail -n 1 "$JOIN_TMP")"
+[ "$join_last_line" = "#JOIN_END $expected_join_rows" ] || {
+  echo 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2
+  exit 70
+}
+actual_join_lines="$(wc -l < "$JOIN_TMP")"
+[ "$actual_join_lines" -eq "$((expected_join_rows + 1))" ] || {
+  echo 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2
+  exit 70
+}
 
-  prev="$(awk -v ip="$ip" '$1==ip {print; exit}' "$PREV_STATE_TMP")"
-  set -- $prev
-  if [ "${1:-}" = "$ip" ]; then
-    prev_outp="${2:-0}"
-    prev_outb="${3:-0}"
-    prev_inp="${4:-0}"
-    prev_inb="${5:-0}"
-    prev_active_state="${6:-false}"
-    prev_assignment_pending="${7:-false}"
-    prev_last_active="${8:-0}"
-    prev_last_reassign="${9:-0}"
-  else
-    prev_outp=0
-    prev_outb=0
-    prev_inp=0
-    prev_inb=0
-    prev_active_state=false
-    prev_assignment_pending=false
-    prev_last_active=0
-    prev_last_reassign=0
-  fi
-
+while read -r ip cls tag outp outb inp inb prev_outp prev_outb prev_inp prev_inb prev_active_state prev_assignment_pending prev_last_active prev_last_reassign rest; do
+  [ "$ip" = '#JOIN_END' ] && break
   if [ "$COUNTER_BASELINE_READY" != true ]; then
     prev_outp="$outp"
     prev_outb="$outb"
@@ -266,10 +304,10 @@ grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest
     prev_inb="$inb"
   fi
 
-  delta_outp="$(safe_delta "$outp" "$prev_outp")"
-  delta_outb="$(safe_delta "$outb" "$prev_outb")"
-  delta_inp="$(safe_delta "$inp" "$prev_inp")"
-  delta_inb="$(safe_delta "$inb" "$prev_inb")"
+  safe_delta_result "$outp" "$prev_outp"; delta_outp="$sd_result"
+  safe_delta_result "$outb" "$prev_outb"; delta_outb="$sd_result"
+  safe_delta_result "$inp" "$prev_inp"; delta_inp="$sd_result"
+  safe_delta_result "$inb" "$prev_inb"; delta_inb="$sd_result"
   delta_packets=$((delta_outp + delta_inp))
   delta_bytes=$((delta_outb + delta_inb))
 
@@ -305,7 +343,7 @@ grep -Ev '^[[:space:]]*(#|$)' "$SEL" 2>/dev/null | while read -r ip cls tag rest
   printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
     "$ip" "$cls" "$tag" "$active_now" "$active_state" "$prev_active_state" "$assignment_pending" "$cooldown_ok" \
     "$outp" "$outb" "$inp" "$inb" "$delta_packets" "$delta_bytes" "$last_active" "$prev_last_reassign" >> "$TMP"
-done
+done < "$JOIN_TMP"
 
 blocked=false
 block_reason=""
