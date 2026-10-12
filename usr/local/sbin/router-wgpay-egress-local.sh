@@ -279,19 +279,47 @@ awk '
   exit 70
 }
 
-# Independent cardinality plus EOF evidence rejects logically incomplete output,
-# including an awk wrapper/process that returns 0 after emitting only a prefix.
-expected_join_rows="$(grep -Evc '^[[:space:]]*(#|$)' "$SEL")" || {
-  [ "$expected_join_rows" = 0 ] || { echo 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2; exit 70; }
-}
-join_last_line="$(tail -n 1 "$JOIN_TMP")"
-[ "$join_last_line" = "#JOIN_END $expected_join_rows" ] || {
-  echo 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2
-  exit 70
-}
-actual_join_lines="$(wc -l < "$JOIN_TMP")"
-[ "$actual_join_lines" -eq "$((expected_join_rows + 1))" ] || {
-  echo 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2
+# Reject truncated OR malformed batch output before any state/action mutation.
+# The selector is the independent source of ordered row identity. Duplicate IP
+# rows remain permitted and must appear in the same order (no map dedup).
+# Numeric fields are restricted to canonical unsigned signed-64-bit decimal;
+# this prevents BusyBox ash arithmetic failures (e.g. nft "08" parsed as octal)
+# from aborting the parent shell after partially emitting row state.
+awk '
+  BEGIN {n=0; emitted=0}
+  function canonical_uint(x) {
+    if (x !~ /^(0|[1-9][0-9]*)$/) return 0
+    if (length(x) > 19) return 0
+    if (length(x) == 19 && ("x" x) > ("x9223372036854775807")) return 0
+    return 1
+  }
+  FILENAME==ARGV[1] {
+    if ($0 ~ /^[[:space:]]*(#|$)/ || NF < 1) next
+    n++
+    expected_ip[n]=$1
+    expected_class[n]=$2
+    expected_target[n]=$3
+    next
+  }
+  FILENAME==ARGV[2] {
+    if ($1 == "#JOIN_END") {
+      if (seen_end || NF != 2 || $0 != ("#JOIN_END " n) || emitted != n) bad=1
+      seen_end=1
+      next
+    }
+    if (seen_end || NF != 15) { bad=1; next }
+    emitted++
+    if (emitted > n || $1 != expected_ip[emitted] ||
+        $2 != expected_class[emitted] || $3 != expected_target[emitted]) bad=1
+    for (i=4; i<=11; i++) if (!canonical_uint($i)) bad=1
+    if ($12 != "true" && $12 != "false") bad=1
+    if ($13 != "true" && $13 != "false") bad=1
+    if (!canonical_uint($14) || !canonical_uint($15)) bad=1
+    next
+  }
+  END { if (bad || !seen_end || emitted != n) exit 1 }
+' "$SEL" "$JOIN_TMP" || {
+  printf '%s\n' 'STOP=SELECTOR_BATCH_JOIN_FAILED' >&2
   exit 70
 }
 
